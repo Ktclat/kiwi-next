@@ -1,0 +1,26 @@
+name: Kiwi Next source and bootstrap checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Exercise the build helpers and isolated extension fixture
+        run: python3 -m unittest discover -s tests -v
+      - name: Verify official source pins
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/kiwi.py verify
+      - name: Measure runner capacity without downloading Chromium
+        run: python3 tools/kiwi.py preflight . --report-only

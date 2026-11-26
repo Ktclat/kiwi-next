@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "Kiwi Next local extension smoke",
+  "version": "0.1.0",
+  "description": "Only marks the local synthetic test page.",
+  "content_scripts": [{
+    "matches": ["http://127.0.0.1/*"],
+    "js": ["mark.js"],
+    "run_at": "document_idle"
+  }]
+}

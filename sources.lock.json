@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "sources": [
+    {
+      "role": "heritage",
+      "repo": "kiwibrowser/src.next",
+      "tag": "12867802748",
+      "commit": "aa79eb02371e2fed148fb47fee3b33bd53d41385",
+      "version": "105.0.5195.24",
+      "blobs": {
+        "chrome/VERSION": "5e598c54d97bdf4cccc50bbce0fe676d3e65b9f4",
+        "CHROMIUM_VERSION": "071a5ac78cf939140e65728484cbe1582400b684",
+        "LICENSE": "fddf3509e9ccdbb1f131a4b590da686e9f6a708f"
+      }
+    },
+    {
+      "role": "candidate",
+      "repo": "chromium/chromium",
+      "tag": "158.0.8127.92",
+      "commit": "aa8057651dc34373e52d0a0cefd7904a11b3e130",
+      "version": "158.0.8127.92",
+      "blobs": {
+        "chrome/VERSION": "60ad72c34ac5e8bb2e972ee565324d8c6b595c03",
+        "build/config/chrome_build.gni": "92cffc2beb18c91ec33d6647783a040c4c3520c0",
+        "extensions/buildflags/buildflags.gni": "cb6caf8f64f0fbfbda775fd1020caf846deaa66a",
+        "chrome/android/chrome_public_apk_tmpl.gni": "7817cd680fe2c3827bbadc85f8684f64d94fc82e",
+        "LICENSE": "2249a28657f86c645f8978b75babc1bd52aca318"
+      }
+    }
+  ]
+}
