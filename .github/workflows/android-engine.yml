@@ -57,6 +57,19 @@ jobs:
           git -C "$tools" fetch --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$DEPOT_TOOLS_REVISION"
           git -C "$tools" checkout -q --detach FETCH_HEAD
           [[ "$(git -C "$tools" rev-parse HEAD)" == "$DEPOT_TOOLS_REVISION" ]]
+          # With DEPOT_TOOLS_UPDATE=0, gclient skips both the git update and
+          # its normal bundled Python setup. Run only the pinned bootstrap.
+          (
+            cd "$tools"
+            base_dir="$tools"
+            set +u # The upstream shell bootstrap uses optional environment variables.
+            source ./cipd_bin_setup.sh
+            cipd_bin_setup
+            source ./bootstrap_python3
+            bootstrap_python3
+          )
+          [[ -s "$tools/python3_bin_reldir.txt" ]]
+          [[ "$(git -C "$tools" rev-parse HEAD)" == "$DEPOT_TOOLS_REVISION" ]]
           echo "$tools" >> "$GITHUB_PATH"
       - name: Sync pinned Chromium Android source and dependencies
         shell: bash
