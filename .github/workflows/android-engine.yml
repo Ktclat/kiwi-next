@@ -1,0 +1,98 @@
+name: Kiwi Next Android engine feasibility
+
+on:
+  push:
+    branches: [test/android-engine]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-engine-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  x64:
+    if: github.repository == 'Ktclat/kiwi-next' && github.ref == 'refs/heads/test/android-engine'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      DEPOT_TOOLS_UPDATE: '0'
+      DEPOT_TOOLS_REVISION: ac31fc680158b9ad57e4020e53943a6abd85fcd7
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Check capacity on a disposable hosted runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${RUNNER_ENVIRONMENT:-}" != github-hosted ]]; then
+            echo "Only run disk preparation on a disposable GitHub-hosted runner" >&2
+            exit 1
+          fi
+          echo "Before preparation"
+          df -h "$RUNNER_TEMP"
+          # This specific Linux runner is dedicated to Android Chromium.
+          # Remove only the unrelated preinstalled toolchains, not SDK or user files.
+          sudo rm -rf -- /usr/share/dotnet /opt/ghc /usr/local/swift
+          echo "After preparation"
+          df -h "$RUNNER_TEMP"
+          python3 tools/kiwi.py preflight "$RUNNER_TEMP"
+      - name: Verify and prepare official sources
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 tools/kiwi.py verify
+          tools="$RUNNER_TEMP/depot_tools"
+          git init -q "$tools"
+          git -C "$tools" fetch --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$DEPOT_TOOLS_REVISION"
+          git -C "$tools" checkout -q --detach FETCH_HEAD
+          [[ "$(git -C "$tools" rev-parse HEAD)" == "$DEPOT_TOOLS_REVISION" ]]
+          echo "$tools" >> "$GITHUB_PATH"
+      - name: Sync pinned Chromium Android source and dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(jq -er '.sources[] | select(.role=="candidate") | .commit' sources.lock.json)"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          mkdir "$RUNNER_TEMP/chromium"
+          cd "$RUNNER_TEMP/chromium"
+          gclient config --name src --unmanaged https://chromium.googlesource.com/chromium/src.git
+          printf "\ntarget_os = ['android']\n" >> .gclient
+          gclient sync --nohooks --no-history --revision "src@$sha"
+          [[ "$(git -C src rev-parse HEAD)" == "$sha" ]]
+          df -h .
+      - name: Generate and build the separate x64 Android test package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/chromium/src"
+          build/install-build-deps.sh --android --no-prompt
+          gclient runhooks
+          python3 "$GITHUB_WORKSPACE/tools/kiwi.py" prepare "$PWD" x64
+          gn gen out/kiwinext-x64 --fail-on-unused-args
+          autoninja -C out/kiwinext-x64 chrome_public_apk
+          apk="$PWD/out/kiwinext-x64/apks/ChromePublic.apk"
+          test -s "$apk"
+          sdk_tools="$(find "$ANDROID_HOME/build-tools" -maxdepth 1 -mindepth 1 -type d | sort -V | tail -n1)"
+          "$sdk_tools/aapt" dump badging "$apk" > "$RUNNER_TEMP/apk-details.txt"
+          grep -F "package: name='io.github.ktclat.kiwinext.dev'" "$RUNNER_TEMP/apk-details.txt"
+          grep -F "native-code: 'x86_64'" "$RUNNER_TEMP/apk-details.txt"
+          "$sdk_tools/apksigner" verify --print-certs "$apk" >> "$RUNNER_TEMP/apk-details.txt"
+          stage="$RUNNER_TEMP/kiwi-engine-qa"
+          mkdir "$stage"
+          cp "$apk" "$stage/kiwinext-x64-dev.apk"
+          cp "$RUNNER_TEMP/apk-details.txt" "$stage/"
+          git rev-parse HEAD > "$stage/chromium-commit.txt"
+          printf '%s\n' "$DEPOT_TOOLS_REVISION" > "$stage/depot-tools-commit.txt"
+          (cd "$stage" && sha256sum kiwinext-x64-dev.apk > SHA256SUMS.txt)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: x64-engine-feasibility-only
+          path: ${{ runner.temp }}/kiwi-engine-qa/
+          if-no-files-found: error
+          retention-days: 7

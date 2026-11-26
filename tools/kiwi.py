@@ -84,12 +84,13 @@ def verify_remote(sources, fetch=github):
         print(f"Verified {s['role']}: {repo} {s['tag']} / {sha} (source VERSION {s['version']})")
 
 
-def check_capacity(path):
+def check_capacity(path, minimum=MIN_BYTES):
     free = shutil.disk_usage(path).free
     if platform.system() != "Linux" or platform.machine() not in ("x86_64", "AMD64"):
         raise ValueError("Use an x86-64 Linux build host")
-    if free < MIN_BYTES:
-        raise ValueError(f"{path} has {free / GIB:.1f} GiB free; Chromium documents at least 100 GB")
+    if free < minimum:
+        why = "Chromium documents at least 100 GB" if minimum == MIN_BYTES else f"the build reserves {minimum / GIB:.0f} GiB for output"
+        raise ValueError(f"{path} has {free / GIB:.1f} GiB free; {why}")
     return free
 
 
@@ -100,7 +101,7 @@ def gn_text(arch):
         "# Kiwi Next engineering profile. Not a production or official Chrome build.",
         'target_os = "android"', f'target_cpu = "{arch}"',
         'is_debug = false', 'is_official_build = false', 'is_chrome_branded = false',
-        'is_component_build = false', 'symbol_level = 1',
+        'is_component_build = false', 'symbol_level = 0',
         '# Use Chromium Android desktop-extension code for the phone feasibility build.',
         'is_desktop_android = true',
         f'chrome_public_manifest_package = "{PACKAGE}"', "",
@@ -110,7 +111,7 @@ def gn_text(arch):
 def prepare(src, arch, candidate):
     if not (src / ".git").exists() or not (src / "chrome" / "VERSION").is_file():
         raise ValueError("Pass the Chromium source root from an Android gclient checkout")
-    check_capacity(src)
+    check_capacity(src, 30 * GIB)
     head = subprocess.check_output(["git", "-C", str(src), "rev-parse", "HEAD"], text=True).strip()
     if head != candidate["commit"] or version((src / "chrome" / "VERSION").read_bytes()) != candidate["version"]:
         raise ValueError("Checkout does not match the pinned Chromium source")
