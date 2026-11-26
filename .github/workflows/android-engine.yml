@@ -36,7 +36,12 @@ jobs:
           df -h "$RUNNER_TEMP"
           # This specific Linux runner is dedicated to Android Chromium.
           # Remove only the unrelated preinstalled toolchains, not SDK or user files.
-          sudo rm -rf -- /usr/share/dotnet /opt/ghc /usr/local/swift
+          sudo rm -rf -- /usr/share/dotnet /opt/ghc /usr/local/swift /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          # Chromium sync uses its own pinned NDK. Keep the runner build-tools
+          # for aapt/apksigner and do not remove the whole Android installation.
+          if [[ "$ANDROID_HOME" == /usr/local/lib/android/sdk ]]; then
+            sudo rm -rf -- "$ANDROID_HOME/ndk"
+          fi
           echo "After preparation"
           df -h "$RUNNER_TEMP"
           python3 tools/kiwi.py preflight "$RUNNER_TEMP"
