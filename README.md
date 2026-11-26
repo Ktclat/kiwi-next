@@ -4,7 +4,7 @@
 
 **当前阶段：源码与构建入口。没有可安装的 Kiwi Next APK。**
 
-- 历史参考：Kiwi Browser 官方 [最后一代公开构建](https://github.com/kiwibrowser/src.next/releases/tag/12867802748)。该发布页写 `132.0.6961.0`，对应源码的 `chrome/VERSION` 与 `CHROMIUM_VERSION` 均为 `105.0.5195.24`。两者不是同一个证据，历史版本不作为新产品内核。
+- 历史参考：Kiwi Browser 官方 [2025 年 1 月公开快照](https://github.com/kiwibrowser/src.next/releases/tag/12867802748)，上游还提供 [4 月下载](https://github.com/kiwibrowser/src.next/releases/tag/14310011181)。发布页的版本标签与源码中的 `105.0.5195.24` 不同；没有从标签反推 APK 内核，历史源码只用于还原功能。
 - 第一轮构建候选：Chromium `158.0.8127.92`，Google 在 2026-11-23 公告的 Android 常规更新。同期 159 是小流量 Early Stable。真正发版本前要重新核对最新 Android Stable，不把这里的锁定当作一直安全的版本。
 - 构建候选沿用 Chromium 自有 Android 扩展支持，不引入第三方浏览器远控桥、捆绑扩展或 Kiwi 的签名密钥。
 
