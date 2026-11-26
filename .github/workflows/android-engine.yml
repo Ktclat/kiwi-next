@@ -16,7 +16,8 @@ jobs:
   x64:
     if: github.repository == 'Ktclat/kiwi-next' && github.ref == 'refs/heads/test/android-engine'
     runs-on: ubuntu-24.04
-    timeout-minutes: 240
+    # Stay below the hosted six-hour limit, with time left for diagnostics.
+    timeout-minutes: 355
     env:
       DEPOT_TOOLS_UPDATE: '0'
       DEPOT_TOOLS_REVISION: ac31fc680158b9ad57e4020e53943a6abd85fcd7
@@ -84,7 +85,7 @@ jobs:
           gclient sync --nohooks --no-history --revision "src@$sha"
           [[ "$(git -C src rev-parse HEAD)" == "$sha" ]]
           df -h .
-      - name: Generate and build the separate x64 Android test package
+      - name: Install pinned Android dependencies and generate GN
         shell: bash
         run: |
           set -euo pipefail
@@ -93,7 +94,47 @@ jobs:
           gclient runhooks
           python3 "$GITHUB_WORKSPACE/tools/kiwi.py" prepare "$PWD" x64
           gn gen out/kiwinext-x64 --fail-on-unused-args
-          autoninja -C out/kiwinext-x64 chrome_public_apk
+      - name: Compile the x64 Android test package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/chromium/src"
+          log="$RUNNER_TEMP/kiwi-compile.log"
+          export NINJA_STATUS='[%f/%t] '
+          timeout --kill-after=30s 325m autoninja -C out/kiwinext-x64 chrome_public_apk > "$log" 2>&1 &
+          compiler=$!
+          (
+            sleeper=
+            trap 'if [[ -n "$sleeper" ]]; then kill "$sleeper" 2>/dev/null || true; fi; exit 0' TERM
+            while kill -0 "$compiler" 2>/dev/null; do
+              sleep 600 &
+              sleeper=$!
+              wait "$sleeper" || break
+              sleeper=
+              kill -0 "$compiler" 2>/dev/null || break
+              printf 'Build heartbeat at %s\n' "$(date -u +%FT%TZ)"
+              tail -n 3 "$log"
+              df -h .
+            done
+          ) &
+          reporter=$!
+          trap 'kill "$reporter" "$compiler" 2>/dev/null || true' EXIT
+          status=0
+          wait "$compiler" || status=$?
+          kill "$reporter" 2>/dev/null || true
+          wait "$reporter" 2>/dev/null || true
+          trap - EXIT
+          tail -n 60 "$log"
+          df -h .
+          if [[ "$status" == 124 ]]; then
+            echo "::error::Chromium compilation exceeded its 325-minute budget"
+          fi
+          exit "$status"
+      - name: Verify package identity, ABI, signature and digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/chromium/src"
           apk="$PWD/out/kiwinext-x64/apks/ChromePublic.apk"
           test -s "$apk"
           sdk_tools="$(find "$ANDROID_HOME/build-tools" -maxdepth 1 -mindepth 1 -type d | sort -V | tail -n1)"
