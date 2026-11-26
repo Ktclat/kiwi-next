@@ -10,7 +10,9 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
@@ -62,8 +64,25 @@ def github(path):
     request = Request("https://api.github.com/" + path, headers=headers)
     if token:
         request.add_unredirected_header("Authorization", "Bearer " + token)
-    with urlopen(request, timeout=20) as rsp:
-        return json.load(rsp)
+    for attempt in range(2):
+        try:
+            with urlopen(request, timeout=20) as rsp:
+                return json.load(rsp)
+        except HTTPError as exc:
+            exhausted = exc.headers.get("X-RateLimit-Remaining") == "0"
+            retry_after = exc.headers.get("Retry-After", "")
+            if attempt or (exc.code != 429 and not (exc.code == 403 and (exhausted or retry_after))):
+                raise
+            delay = max(1, int(retry_after)) if retry_after.isdecimal() else 60
+            if exhausted:
+                reset = exc.headers.get("X-RateLimit-Reset", "")
+                if not reset.isdecimal():
+                    raise
+                delay = max(delay, int(reset) - int(time.time()) + 1)
+            if delay > 120:
+                raise
+            print(f"GitHub rate limited {path}; waiting {delay}s before one retry", file=sys.stderr)
+            time.sleep(delay)
 
 
 def verify_remote(sources, fetch=github):

@@ -1,14 +1,35 @@
 import base64
+import io
 import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 from tools import kiwi
 
 
 class BootstrapTests(unittest.TestCase):
+    def test_github_rate_limit_retries_once_after_advertised_delay(self):
+        err = HTTPError("https://api.github.com/", 429, "rate limited", {"Retry-After": "10"}, None)
+        with patch.object(kiwi, "urlopen", side_effect=[err, io.BytesIO(b'{"ok":true}')]) as fetch, \
+                patch.object(kiwi.time, "sleep") as sleep:
+            self.assertEqual(kiwi.github("example"), {"ok": True})
+            sleep.assert_called_once_with(10)
+            self.assertEqual(fetch.call_count, 2)
+
+    def test_github_does_not_retry_permission_error_or_long_limit(self):
+        for status, headers in ((403, {}), (429, {"Retry-After": "121"}),
+                                (403, {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "400"})):
+            err = HTTPError("https://api.github.com/", status, "refused", headers, None)
+            with patch.object(kiwi, "urlopen", side_effect=err) as fetch, \
+                    patch.object(kiwi.time, "time", return_value=100), patch.object(kiwi.time, "sleep") as sleep:
+                with self.assertRaises(HTTPError):
+                    kiwi.github("example")
+                sleep.assert_not_called()
+                self.assertEqual(fetch.call_count, 1)
+
     def test_pinned_official_sources(self):
         sources = kiwi.read_lock()
         self.assertLess(int(sources[0]["version"].split(".")[0]), int(sources[1]["version"].split(".")[0]))
