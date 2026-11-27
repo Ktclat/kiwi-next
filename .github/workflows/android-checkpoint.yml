@@ -1,9 +1,9 @@
-name: Kiwi Android compiler-cache probe
+name: Kiwi Android APK continuation probe
 
 on:
   push:
     branches: [test/android-checkpoint]
-    paths: ['.github/workflows/android-checkpoint.yml']
+    paths: ['.github/workflows/android-checkpoint.yml', 'tools/compare_ninja_progress.py']
 
 permissions:
   contents: read
@@ -15,13 +15,13 @@ concurrency:
 env:
   DEPOT_TOOLS_UPDATE: '0'
   DEPOT_TOOLS_REVISION: ac31fc680158b9ad57e4020e53943a6abd85fcd7
-  CHECKPOINT_KEY: kiwi-ccache-v1-${{ github.run_id }}-${{ github.run_attempt }}
+  CHECKPOINT_KEY: kiwi-apk-ccache-v1-${{ github.run_id }}-${{ github.run_attempt }}
 
 jobs:
   seed:
     if: github.repository == 'Ktclat/kiwi-next' && github.ref == 'refs/heads/test/android-checkpoint'
     runs-on: ubuntu-24.04
-    timeout-minutes: 65
+    timeout-minutes: 80
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -102,7 +102,7 @@ jobs:
           GN_ARGS
           gn gen out/kiwinext-x64 --fail-on-unused-args
 
-      - name: Build a pinned Android library with ccache
+      - name: Time-box the real APK build and save compiler results
         shell: bash
         run: |
           set -euo pipefail
@@ -110,11 +110,11 @@ jobs:
           out=out/kiwinext-x64
           exchange="$RUNNER_TEMP/kiwi-checkpoint"
           export CCACHE_DIR="$RUNNER_TEMP/kiwi-ccache"
-          export CCACHE_MAXSIZE=256Mi
+          export CCACHE_MAXSIZE=2Gi
           export CCACHE_COMPILERCHECK=content
           export CCACHE_CONFIGPATH=/dev/null
           mkdir "$CCACHE_DIR"
-          [[ ! -e "$out/obj/base/libbase.a" ]]
+          [[ ! -e "$out/.ninja_log" ]]
           metric() { awk -v key="$1" '$1 == key {print $2}' "$2"; }
           fingerprint() {
             printf '%s\n' "$(pwd -P)" "${ImageVersion:?}" "$(git rev-parse HEAD)" "$DEPOT_TOOLS_REVISION" "$(sha256sum "$out/args.gn")"
@@ -122,34 +122,37 @@ jobs:
           }
           mkdir "$exchange"
           /usr/bin/ccache --zero-stats
-          start=$SECONDS
           log="$RUNNER_TEMP/kiwi-ccache-build.log"
-          if timeout --kill-after=30s 35m autoninja -C "$out" base:base > "$log" 2>&1; then
-            tail -n 7 "$log"
-          else
-            rc=$?
-            tail -n 60 "$log"
-            exit "$rc"
-          fi
+          start=$SECONDS
+          rc=0
+          timeout --signal=INT --kill-after=30s 30m autoninja -C "$out" chrome_public_apk > "$log" 2>&1 || rc=$?
           elapsed=$((SECONDS-start))
-          test -s "$out/obj/base/libbase.a"
+          tail -n 20 "$log"
+          if (( rc == 0 )); then
+            test -s "$out/apks/ChromePublic.apk"
+          elif (( rc != 124 )) || ! grep -Fq "interrupted by user" "$log"; then
+            echo "::error::APK build failed, rather than reaching the planned cutoff (exit $rc)"
+            exit 1
+          fi
+          test -s "$out/.ninja_log"
           stats="$RUNNER_TEMP/ccache-stats.tsv"
           /usr/bin/ccache --print-stats > "$stats"
-          /usr/bin/ccache --show-stats
+          /usr/bin/ccache --show-stats --verbose
           misses="$(metric cache_miss "$stats")"
           direct="$(metric direct_cache_hit "$stats")"
           preprocessed="$(metric preprocessed_cache_hit "$stats")"
           [[ "$misses" =~ ^[0-9]+$ && "$direct" =~ ^[0-9]+$ && "$preprocessed" =~ ^[0-9]+$ ]]
-          (( misses >= 100 )) || { echo "::error::Compiler wrapper did not cache a meaningful number of actions"; exit 1; }
+          (( misses >= 100 )) || { echo "::error::Fewer than 100 cacheable cold compiler calls"; exit 1; }
+          cp "$out/.ninja_log" "$exchange/seed.ninja_log"
           read -r bytes _ < <(du -sb "$CCACHE_DIR")
           printf 'Local compiler cache: %s bytes\n' "$bytes"
-          (( bytes > 10000 && bytes <= 320 * 1024 * 1024 ))
+          (( bytes > 10000 && bytes <= 2560 * 1024 * 1024 ))
           tar --format=posix -C "$CCACHE_DIR" -cf - . | zstd -q -T2 -3 -o "$exchange/ccache.tar.zst"
           compressed="$(stat -c %s "$exchange/ccache.tar.zst")"
-          (( compressed <= 320 * 1024 * 1024 ))
+          (( compressed <= 2560 * 1024 * 1024 ))
           fingerprint > "$exchange/inputs.txt"
           printf '%s\n' "$misses" > "$exchange/seed-misses.txt"
-          (cd "$exchange" && sha256sum ccache.tar.zst > SHA256SUMS)
+          (cd "$exchange" && sha256sum ccache.tar.zst seed.ninja_log inputs.txt seed-misses.txt > SHA256SUMS)
           printf 'Seed: %s compiler misses in %ss; archive %s bytes.\n' "$misses" "$elapsed" "$compressed" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Save bounded compiler cache
         uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7
@@ -160,7 +163,7 @@ jobs:
     needs: seed
     if: github.repository == 'Ktclat/kiwi-next' && github.ref == 'refs/heads/test/android-checkpoint'
     runs-on: ubuntu-24.04
-    timeout-minutes: 65
+    timeout-minutes: 80
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -248,7 +251,7 @@ jobs:
           path: ${{ runner.temp }}/kiwi-checkpoint
           key: ${{ env.CHECKPOINT_KEY }}
           fail-on-cache-miss: true
-      - name: Require real compiler hits on a fresh runner
+      - name: Compare fresh-runner APK progress at the same time budget
         if: steps.compiler-cache.outputs.cache-hit == 'true'
         shell: bash
         run: |
@@ -257,11 +260,11 @@ jobs:
           out=out/kiwinext-x64
           exchange="$RUNNER_TEMP/kiwi-checkpoint"
           export CCACHE_DIR="$RUNNER_TEMP/kiwi-ccache"
-          export CCACHE_MAXSIZE=256Mi
+          export CCACHE_MAXSIZE=2Gi
           export CCACHE_COMPILERCHECK=content
           export CCACHE_CONFIGPATH=/dev/null
           mkdir "$CCACHE_DIR"
-          [[ ! -e "$out/obj/base/libbase.a" ]]
+          [[ ! -e "$out/.ninja_log" ]]
           metric() { awk -v key="$1" '$1 == key {print $2}' "$2"; }
           fingerprint() {
             printf '%s\n' "$(pwd -P)" "${ImageVersion:?}" "$(git rev-parse HEAD)" "$DEPOT_TOOLS_REVISION" "$(sha256sum "$out/args.gn")"
@@ -271,20 +274,22 @@ jobs:
           (cd "$exchange" && sha256sum -c SHA256SUMS)
           zstd -qdc "$exchange/ccache.tar.zst" | tar -xf - -C "$CCACHE_DIR" --no-same-owner
           /usr/bin/ccache --zero-stats
-          start=$SECONDS
           log="$RUNNER_TEMP/kiwi-ccache-build.log"
-          if timeout --kill-after=30s 35m autoninja -C "$out" base:base > "$log" 2>&1; then
-            tail -n 7 "$log"
-          else
-            rc=$?
-            tail -n 60 "$log"
-            exit "$rc"
-          fi
+          start=$SECONDS
+          rc=0
+          timeout --signal=INT --kill-after=30s 30m autoninja -C "$out" chrome_public_apk > "$log" 2>&1 || rc=$?
           elapsed=$((SECONDS-start))
-          test -s "$out/obj/base/libbase.a"
+          tail -n 20 "$log"
+          if (( rc == 0 )); then
+            test -s "$out/apks/ChromePublic.apk"
+          elif (( rc != 124 )) || ! grep -Fq "interrupted by user" "$log"; then
+            echo "::error::APK build failed, rather than reaching the planned cutoff (exit $rc)"
+            exit 1
+          fi
+          test -s "$out/.ninja_log"
           stats="$RUNNER_TEMP/ccache-stats.tsv"
           /usr/bin/ccache --print-stats > "$stats"
-          /usr/bin/ccache --show-stats
+          /usr/bin/ccache --show-stats --verbose
           misses="$(metric cache_miss "$stats")"
           direct="$(metric direct_cache_hit "$stats")"
           preprocessed="$(metric preprocessed_cache_hit "$stats")"
@@ -292,11 +297,11 @@ jobs:
           prior="$(cat "$exchange/seed-misses.txt")"
           [[ "$prior" =~ ^[0-9]+$ ]] && (( prior >= 100 ))
           hits=$((direct + preprocessed))
-          printf 'Restore: %s compiler hits, %s misses (seed %s), %ss.\n' "$hits" "$misses" "$prior" "$elapsed" | tee -a "$GITHUB_STEP_SUMMARY"
-          (( hits > 0 && misses * 5 <= prior * 4 )) || {
-            echo "::error::Did not demonstrate 20% fewer uncached compiler invocations"
-            exit 1
-          }
+          read -r bytes _ < <(du -sb "$CCACHE_DIR")
+          printf 'Restore: %s compiler hits, %s misses in %ss (seed had %s misses); cache now %s bytes.\n' "$hits" "$misses" "$elapsed" "$prior" "$bytes" | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/tools/compare_ninja_progress.py" \
+            "$exchange/seed.ninja_log" "$out/.ninja_log" | tee -a "$GITHUB_STEP_SUMMARY"
+          (( hits > 0 )) || { echo "::error::No cross-run APK compiler reuse"; exit 1; }
       - name: Reject a non-exact cache result
         if: steps.compiler-cache.outputs.cache-hit != 'true'
         run: exit 1
