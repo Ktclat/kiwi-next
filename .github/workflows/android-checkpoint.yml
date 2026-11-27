@@ -1,4 +1,4 @@
-name: Kiwi Android checkpoint probe
+name: Kiwi Android Siso action-cache probe
 
 on:
   push:
@@ -15,7 +15,7 @@ concurrency:
 env:
   DEPOT_TOOLS_UPDATE: '0'
   DEPOT_TOOLS_REVISION: ac31fc680158b9ad57e4020e53943a6abd85fcd7
-  CHECKPOINT_KEY: kiwi-probe-v1-${{ github.run_id }}-${{ github.run_attempt }}
+  CHECKPOINT_KEY: kiwi-siso-action-v1-${{ github.run_id }}-${{ github.run_attempt }}
 
 jobs:
   seed:
@@ -96,33 +96,43 @@ jobs:
           python3 "$GITHUB_WORKSPACE/tools/kiwi.py" prepare "$PWD" x64
           gn gen out/kiwinext-x64 --fail-on-unused-args
 
-      - name: Build a real Android Chromium library and record objects
+      - name: Compile base from scratch and populate the action cache
         shell: bash
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP/chromium/src"
           out=out/kiwinext-x64
-          gn desc "$out" //base:base > /dev/null
-          timeout --kill-after=30s 45m autoninja -C "$out" base:base > "$RUNNER_TEMP/kiwi-seed.log" 2>&1 || {
-            rc=$?
-            tail -n 60 "$RUNNER_TEMP/kiwi-seed.log"
-            exit "$rc"
-          }
-          tail -n 5 "$RUNNER_TEMP/kiwi-seed.log"
-          checkpoint="$RUNNER_TEMP/kiwi-checkpoint"
-          mkdir "$checkpoint"
+          cache="$RUNNER_TEMP/kiwi-siso-action-cache"
+          exchange="$RUNNER_TEMP/kiwi-checkpoint"
+          local_exec() { sed -nE 's/.*localexec\/[0-9]+[[:space:]]+([0-9]+)\(.*/\1/p' "$1" | tail -n1; }
+          cache_hits() { sed -nE 's/^.*noexec:[0-9]+ local:[0-9]+ remote:[0-9]+ cache:([0-9]+) .*/\1/p' "$1" | tail -n1; }
+          mkdir "$exchange" "$cache"
+          [[ ! -e "$out/obj/base/libbase.a" ]]
+          log="$RUNNER_TEMP/siso-seed.log"
           start=$SECONDS
-          # Save the full generated output, including dotfiles, but no checkout or credentials.
-          tar --format=posix -C out -cf - kiwinext-x64 | zstd -q -T2 -3 -o "$checkpoint/output.tar.zst"
-          bytes="$(stat -c %s "$checkpoint/output.tar.zst")"
-          printf 'Compressed size: %s bytes; archive time: %ss\n' "$bytes" "$((SECONDS-start))"
-          (( bytes <= 256 * 1024 * 1024 )) || { echo "Probe exceeded its 256 MiB cache budget"; exit 1; }
-          find "$out/obj/base" -type f -name '*.o' -printf '%p\t%T@\t%s\n' | LC_ALL=C sort > "$checkpoint/objects.tsv"
-          [[ "$(wc -l < "$checkpoint/objects.tsv")" -ge 5 ]]
-          printf '%s\n' "$(pwd -P)" "${ImageVersion:?}" "$(git rev-parse HEAD)" "$DEPOT_TOOLS_REVISION" "$(sha256sum "$out/args.gn")" > "$checkpoint/inputs.txt"
-          (cd "$checkpoint" && sha256sum output.tar.zst > SHA256SUMS)
-          printf 'Seed: %s compiled objects, %s compressed bytes.\n' "$(wc -l < "$checkpoint/objects.tsv")" "$bytes" >> "$GITHUB_STEP_SUMMARY"
-      - name: Save this run's checkpoint only
+          if timeout --kill-after=30s 35m siso ninja -C "$out" -local_cache_enable -cache_dir "$cache" -re_cache_enable_read=false -re_cache_enable_write=false base:base > "$log" 2>&1; then
+            tail -n 16 "$log"
+          else
+            rc=$?
+            tail -n 60 "$log"
+            exit "$rc"
+          fi
+          elapsed=$((SECONDS-start))
+          local_count="$(local_exec "$log")"
+          [[ "$local_count" =~ ^[0-9]+$ ]] && (( local_count > 100 ))
+          test -s "$out/obj/base/libbase.a"
+          read -r raw_bytes _ < <(du -sb "$cache")
+          (( raw_bytes > 10000 && raw_bytes <= 1024 * 1024 * 1024 ))
+          start=$SECONDS
+          tar --format=posix -C "$cache" -cf - . | zstd -q -T2 -3 -o "$exchange/action-cache.tar.zst"
+          bytes="$(stat -c %s "$exchange/action-cache.tar.zst")"
+          printf 'Action cache: %s raw bytes, %s compressed bytes in %ss\n' "$raw_bytes" "$bytes" "$((SECONDS-start))"
+          (( bytes <= 512 * 1024 * 1024 )) || { echo "Probe exceeded its 512 MiB transport budget"; exit 1; }
+          printf '%s\n' "$(pwd -P)" "${ImageVersion:?}" "$(git rev-parse HEAD)" "$DEPOT_TOOLS_REVISION" "$(sha256sum "$out/args.gn")" > "$exchange/inputs.txt"
+          printf '%s\n' "$local_count" > "$exchange/seed-local-execs.txt"
+          (cd "$exchange" && sha256sum action-cache.tar.zst > SHA256SUMS)
+          printf 'Seed: %s local subprocesses in %ss.\n' "$local_count" "$elapsed" >> "$GITHUB_STEP_SUMMARY"
+      - name: Save this run's bounded action cache
         uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7
         with:
           path: ${{ runner.temp }}/kiwi-checkpoint
@@ -196,7 +206,7 @@ jobs:
           gclient sync --nohooks --no-history --revision "src@$sha"
           python3 "$GITHUB_WORKSPACE/tools/kiwi.py" verify-checkout src
           df -h .
-      - name: Install pinned Android dependencies and prepare matching args
+      - name: Install pinned Android dependencies and generate GN
         shell: bash
         run: |
           set -euo pipefail
@@ -205,14 +215,15 @@ jobs:
           gclient runhooks
           python3 "$GITHUB_WORKSPACE/tools/kiwi.py" prepare "$PWD" x64
 
-      - name: Restore this run's exact checkpoint
+          gn gen out/kiwinext-x64 --fail-on-unused-args
+      - name: Restore this run's action cache
         uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7
         id: cache
         with:
           path: ${{ runner.temp }}/kiwi-checkpoint
           key: ${{ env.CHECKPOINT_KEY }}
           fail-on-cache-miss: true
-      - name: Require unchanged compiled object state on the fresh runner
+      - name: Check for actual action-cache hits from clean output
         shell: bash
         env:
           EXACT_HIT: ${{ steps.cache.outputs.cache-hit }}
@@ -221,23 +232,33 @@ jobs:
           [[ "$EXACT_HIT" == true ]]
           cd "$RUNNER_TEMP/chromium/src"
           out=out/kiwinext-x64
-          checkpoint="$RUNNER_TEMP/kiwi-checkpoint"
-          printf '%s\n' "$(pwd -P)" "${ImageVersion:?}" "$(git rev-parse HEAD)" "$DEPOT_TOOLS_REVISION" "$(sha256sum "$out/args.gn")" | cmp - "$checkpoint/inputs.txt"
-          (cd "$checkpoint" && sha256sum -c SHA256SUMS)
+          cache="$RUNNER_TEMP/kiwi-siso-action-cache"
+          exchange="$RUNNER_TEMP/kiwi-checkpoint"
+          local_exec() { sed -nE 's/.*localexec\/[0-9]+[[:space:]]+([0-9]+)\(.*/\1/p' "$1" | tail -n1; }
+          cache_hits() { sed -nE 's/^.*noexec:[0-9]+ local:[0-9]+ remote:[0-9]+ cache:([0-9]+) .*/\1/p' "$1" | tail -n1; }
+          printf '%s\n' "$(pwd -P)" "${ImageVersion:?}" "$(git rev-parse HEAD)" "$DEPOT_TOOLS_REVISION" "$(sha256sum "$out/args.gn")" | cmp - "$exchange/inputs.txt"
+          (cd "$exchange" && sha256sum -c SHA256SUMS)
+          mkdir "$cache"
+          zstd -qdc "$exchange/action-cache.tar.zst" | tar -xf - -C "$cache" --no-same-owner
+          [[ ! -e "$out/obj/base/libbase.a" ]]
+          log="$RUNNER_TEMP/siso-restore.log"
           start=$SECONDS
-          zstd -qdc "$checkpoint/output.tar.zst" | tar -xf - -C out --no-same-owner
-          printf 'Extraction time: %ss\n' "$((SECONDS-start))"
-          objects() { find "$out/obj/base" -type f -name '*.o' -printf '%p\t%T@\t%s\n' | LC_ALL=C sort; }
-          # Compare mtimes and sizes before and after, not merely whether cache transport worked.
-          objects > "$RUNNER_TEMP/kiwi-before.tsv"
-          cmp "$checkpoint/objects.tsv" "$RUNNER_TEMP/kiwi-before.tsv"
-          start=$SECONDS
-          timeout --kill-after=30s 15m autoninja -C "$out" base:base > "$RUNNER_TEMP/kiwi-restore.log" 2>&1 || {
+          if timeout --kill-after=30s 35m siso ninja -C "$out" -local_cache_enable -cache_dir "$cache" -re_cache_enable_read=false -re_cache_enable_write=false base:base > "$log" 2>&1; then
+            tail -n 16 "$log"
+          else
             rc=$?
-            tail -n 60 "$RUNNER_TEMP/kiwi-restore.log"
+            tail -n 60 "$log"
             exit "$rc"
+          fi
+          elapsed=$((SECONDS-start))
+          test -s "$out/obj/base/libbase.a"
+          seed_count="$(cat "$exchange/seed-local-execs.txt")"
+          local_count="$(local_exec "$log")"
+          hits="$(cache_hits "$log")"
+          printf 'Seed %s local executions; restore %s executions, %s action-cache hits in %ss.\n' \
+            "$seed_count" "$local_count" "$hits" "$elapsed" | tee -a "$GITHUB_STEP_SUMMARY"
+          [[ "$seed_count" =~ ^[0-9]+$ && "$local_count" =~ ^[0-9]+$ && "$hits" =~ ^[0-9]+$ ]]
+          (( hits > 0 && local_count * 5 <= seed_count * 4 )) || {
+            echo "::error::No demonstrated 20% reduction in local subprocesses"
+            exit 1
           }
-          tail -n 15 "$RUNNER_TEMP/kiwi-restore.log"
-          objects > "$RUNNER_TEMP/kiwi-after.tsv"
-          cmp "$checkpoint/objects.tsv" "$RUNNER_TEMP/kiwi-after.tsv"
-          printf 'Exact cache hit; all %s compiled base objects unchanged after %ss rebuild check.\n' "$(wc -l < "$checkpoint/objects.tsv")" "$((SECONDS-start))" >> "$GITHUB_STEP_SUMMARY"
