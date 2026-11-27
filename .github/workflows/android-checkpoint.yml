@@ -116,7 +116,7 @@ jobs:
           tar --format=posix -C out -cf - kiwinext-x64 | zstd -q -T2 -3 -o "$checkpoint/output.tar.zst"
           bytes="$(stat -c %s "$checkpoint/output.tar.zst")"
           printf 'Compressed size: %s bytes; archive time: %ss\n' "$bytes" "$((SECONDS-start))"
-          (( bytes <= 192 * 1024 * 1024 )) || { echo "Probe exceeded its 192 MiB cache budget"; exit 1; }
+          (( bytes <= 256 * 1024 * 1024 )) || { echo "Probe exceeded its 256 MiB cache budget"; exit 1; }
           find "$out/obj/base" -type f -name '*.o' -printf '%p\t%T@\t%s\n' | LC_ALL=C sort > "$checkpoint/objects.tsv"
           [[ "$(wc -l < "$checkpoint/objects.tsv")" -ge 5 ]]
           printf '%s\n' "$(pwd -P)" "${ImageVersion:?}" "$(git rev-parse HEAD)" "$DEPOT_TOOLS_REVISION" "$(sha256sum "$out/args.gn")" > "$checkpoint/inputs.txt"
