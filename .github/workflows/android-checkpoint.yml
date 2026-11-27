@@ -1,4 +1,4 @@
-name: Kiwi Android Siso action-cache probe
+name: Kiwi Android compiler-cache probe
 
 on:
   push:
@@ -15,7 +15,7 @@ concurrency:
 env:
   DEPOT_TOOLS_UPDATE: '0'
   DEPOT_TOOLS_REVISION: ac31fc680158b9ad57e4020e53943a6abd85fcd7
-  CHECKPOINT_KEY: kiwi-siso-action-v1-${{ github.run_id }}-${{ github.run_attempt }}
+  CHECKPOINT_KEY: kiwi-ccache-v1-${{ github.run_id }}-${{ github.run_attempt }}
 
 jobs:
   seed:
@@ -94,46 +94,64 @@ jobs:
           build/install-build-deps.sh --android --no-prompt
           gclient runhooks
           python3 "$GITHUB_WORKSPACE/tools/kiwi.py" prepare "$PWD" x64
+          sudo apt-get install --no-install-recommends -y ccache
+          /usr/bin/ccache --version
+          cat >> out/kiwinext-x64/args.gn <<'GN_ARGS'
+          use_siso = false
+          cc_wrapper = "/usr/bin/ccache"
+          GN_ARGS
           gn gen out/kiwinext-x64 --fail-on-unused-args
 
-      - name: Compile base from scratch and populate the action cache
+      - name: Build a pinned Android library with ccache
         shell: bash
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP/chromium/src"
           out=out/kiwinext-x64
-          cache="$RUNNER_TEMP/kiwi-siso-action-cache"
           exchange="$RUNNER_TEMP/kiwi-checkpoint"
-          local_exec() { sed -nE 's/.*localexec\/[0-9]+[[:space:]]+([0-9]+)\(.*/\1/p' "$1" | tail -n1; }
-          cache_hits() { sed -nE 's/^.*noexec:[0-9]+ local:[0-9]+ remote:[0-9]+ cache:([0-9]+) .*/\1/p' "$1" | tail -n1; }
-          mkdir "$exchange" "$cache"
+          export CCACHE_DIR="$RUNNER_TEMP/kiwi-ccache"
+          export CCACHE_MAXSIZE=256Mi
+          export CCACHE_COMPILERCHECK=content
+          export CCACHE_CONFIGPATH=/dev/null
+          mkdir "$CCACHE_DIR"
           [[ ! -e "$out/obj/base/libbase.a" ]]
-          log="$RUNNER_TEMP/siso-seed.log"
+          metric() { awk -v key="$1" '$1 == key {print $2}' "$2"; }
+          fingerprint() {
+            printf '%s\n' "$(pwd -P)" "${ImageVersion:?}" "$(git rev-parse HEAD)" "$DEPOT_TOOLS_REVISION" "$(sha256sum "$out/args.gn")"
+            /usr/bin/ccache --version
+          }
+          mkdir "$exchange"
+          /usr/bin/ccache --zero-stats
           start=$SECONDS
-          if timeout --kill-after=30s 35m siso ninja --offline -C "$out" -local_cache_enable -cache_dir "$cache" -re_cache_enable_read=false -re_cache_enable_write=false base:base > "$log" 2>&1; then
-            tail -n 16 "$log"
+          log="$RUNNER_TEMP/kiwi-ccache-build.log"
+          if timeout --kill-after=30s 35m autoninja -C "$out" base:base > "$log" 2>&1; then
+            tail -n 7 "$log"
           else
             rc=$?
             tail -n 60 "$log"
             exit "$rc"
           fi
           elapsed=$((SECONDS-start))
-          local_count="$(local_exec "$log")"
-          [[ "$local_count" =~ ^[0-9]+$ ]] && (( local_count > 100 ))
           test -s "$out/obj/base/libbase.a"
-          read -r raw_bytes _ < <(du -sb "$cache")
-          printf 'Local action-cache size before compression: %s bytes\n' "$raw_bytes"
-          (( raw_bytes > 10000 && raw_bytes <= 1024 * 1024 * 1024 ))
-          start=$SECONDS
-          tar --format=posix -C "$cache" -cf - . | zstd -q -T2 -3 -o "$exchange/action-cache.tar.zst"
-          bytes="$(stat -c %s "$exchange/action-cache.tar.zst")"
-          printf 'Action cache: %s raw bytes, %s compressed bytes in %ss\n' "$raw_bytes" "$bytes" "$((SECONDS-start))"
-          (( bytes <= 512 * 1024 * 1024 )) || { echo "Probe exceeded its 512 MiB transport budget"; exit 1; }
-          printf '%s\n' "$(pwd -P)" "${ImageVersion:?}" "$(git rev-parse HEAD)" "$DEPOT_TOOLS_REVISION" "$(sha256sum "$out/args.gn")" > "$exchange/inputs.txt"
-          printf '%s\n' "$local_count" > "$exchange/seed-local-execs.txt"
-          (cd "$exchange" && sha256sum action-cache.tar.zst > SHA256SUMS)
-          printf 'Seed: %s local subprocesses in %ss.\n' "$local_count" "$elapsed" >> "$GITHUB_STEP_SUMMARY"
-      - name: Save this run's bounded action cache
+          stats="$RUNNER_TEMP/ccache-stats.tsv"
+          /usr/bin/ccache --print-stats > "$stats"
+          /usr/bin/ccache --show-stats
+          misses="$(metric cache_miss "$stats")"
+          direct="$(metric direct_cache_hit "$stats")"
+          preprocessed="$(metric preprocessed_cache_hit "$stats")"
+          [[ "$misses" =~ ^[0-9]+$ && "$direct" =~ ^[0-9]+$ && "$preprocessed" =~ ^[0-9]+$ ]]
+          (( misses >= 100 )) || { echo "::error::Compiler wrapper did not cache a meaningful number of actions"; exit 1; }
+          read -r bytes _ < <(du -sb "$CCACHE_DIR")
+          printf 'Local compiler cache: %s bytes\n' "$bytes"
+          (( bytes > 10000 && bytes <= 320 * 1024 * 1024 ))
+          tar --format=posix -C "$CCACHE_DIR" -cf - . | zstd -q -T2 -3 -o "$exchange/ccache.tar.zst"
+          compressed="$(stat -c %s "$exchange/ccache.tar.zst")"
+          (( compressed <= 320 * 1024 * 1024 ))
+          fingerprint > "$exchange/inputs.txt"
+          printf '%s\n' "$misses" > "$exchange/seed-misses.txt"
+          (cd "$exchange" && sha256sum ccache.tar.zst > SHA256SUMS)
+          printf 'Seed: %s compiler misses in %ss; archive %s bytes.\n' "$misses" "$elapsed" "$compressed" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Save bounded compiler cache
         uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7
         with:
           path: ${{ runner.temp }}/kiwi-checkpoint
@@ -216,36 +234,47 @@ jobs:
           gclient runhooks
           python3 "$GITHUB_WORKSPACE/tools/kiwi.py" prepare "$PWD" x64
 
+          sudo apt-get install --no-install-recommends -y ccache
+          /usr/bin/ccache --version
+          cat >> out/kiwinext-x64/args.gn <<'GN_ARGS'
+          use_siso = false
+          cc_wrapper = "/usr/bin/ccache"
+          GN_ARGS
           gn gen out/kiwinext-x64 --fail-on-unused-args
-      - name: Restore this run's action cache
+      - name: Restore this exact compiler cache
+        id: compiler-cache
         uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7
-        id: cache
         with:
           path: ${{ runner.temp }}/kiwi-checkpoint
           key: ${{ env.CHECKPOINT_KEY }}
           fail-on-cache-miss: true
-      - name: Check for actual action-cache hits from clean output
+      - name: Require real compiler hits on a fresh runner
+        if: steps.compiler-cache.outputs.cache-hit == 'true'
         shell: bash
-        env:
-          EXACT_HIT: ${{ steps.cache.outputs.cache-hit }}
         run: |
           set -euo pipefail
-          [[ "$EXACT_HIT" == true ]]
           cd "$RUNNER_TEMP/chromium/src"
           out=out/kiwinext-x64
-          cache="$RUNNER_TEMP/kiwi-siso-action-cache"
           exchange="$RUNNER_TEMP/kiwi-checkpoint"
-          local_exec() { sed -nE 's/.*localexec\/[0-9]+[[:space:]]+([0-9]+)\(.*/\1/p' "$1" | tail -n1; }
-          cache_hits() { sed -nE 's/^.*noexec:[0-9]+ local:[0-9]+ remote:[0-9]+ cache:([0-9]+) .*/\1/p' "$1" | tail -n1; }
-          printf '%s\n' "$(pwd -P)" "${ImageVersion:?}" "$(git rev-parse HEAD)" "$DEPOT_TOOLS_REVISION" "$(sha256sum "$out/args.gn")" | cmp - "$exchange/inputs.txt"
-          (cd "$exchange" && sha256sum -c SHA256SUMS)
-          mkdir "$cache"
-          zstd -qdc "$exchange/action-cache.tar.zst" | tar -xf - -C "$cache" --no-same-owner
+          export CCACHE_DIR="$RUNNER_TEMP/kiwi-ccache"
+          export CCACHE_MAXSIZE=256Mi
+          export CCACHE_COMPILERCHECK=content
+          export CCACHE_CONFIGPATH=/dev/null
+          mkdir "$CCACHE_DIR"
           [[ ! -e "$out/obj/base/libbase.a" ]]
-          log="$RUNNER_TEMP/siso-restore.log"
+          metric() { awk -v key="$1" '$1 == key {print $2}' "$2"; }
+          fingerprint() {
+            printf '%s\n' "$(pwd -P)" "${ImageVersion:?}" "$(git rev-parse HEAD)" "$DEPOT_TOOLS_REVISION" "$(sha256sum "$out/args.gn")"
+            /usr/bin/ccache --version
+          }
+          fingerprint | cmp - "$exchange/inputs.txt"
+          (cd "$exchange" && sha256sum -c SHA256SUMS)
+          zstd -qdc "$exchange/ccache.tar.zst" | tar -xf - -C "$CCACHE_DIR" --no-same-owner
+          /usr/bin/ccache --zero-stats
           start=$SECONDS
-          if timeout --kill-after=30s 35m siso ninja --offline -C "$out" -local_cache_enable -cache_dir "$cache" -re_cache_enable_read=false -re_cache_enable_write=false base:base > "$log" 2>&1; then
-            tail -n 16 "$log"
+          log="$RUNNER_TEMP/kiwi-ccache-build.log"
+          if timeout --kill-after=30s 35m autoninja -C "$out" base:base > "$log" 2>&1; then
+            tail -n 7 "$log"
           else
             rc=$?
             tail -n 60 "$log"
@@ -253,13 +282,21 @@ jobs:
           fi
           elapsed=$((SECONDS-start))
           test -s "$out/obj/base/libbase.a"
-          seed_count="$(cat "$exchange/seed-local-execs.txt")"
-          local_count="$(local_exec "$log")"
-          hits="$(cache_hits "$log")"
-          printf 'Seed %s local executions; restore %s executions, %s action-cache hits in %ss.\n' \
-            "$seed_count" "$local_count" "$hits" "$elapsed" | tee -a "$GITHUB_STEP_SUMMARY"
-          [[ "$seed_count" =~ ^[0-9]+$ && "$local_count" =~ ^[0-9]+$ && "$hits" =~ ^[0-9]+$ ]]
-          (( hits > 0 && local_count * 5 <= seed_count * 4 )) || {
-            echo "::error::No demonstrated 20% reduction in local subprocesses"
+          stats="$RUNNER_TEMP/ccache-stats.tsv"
+          /usr/bin/ccache --print-stats > "$stats"
+          /usr/bin/ccache --show-stats
+          misses="$(metric cache_miss "$stats")"
+          direct="$(metric direct_cache_hit "$stats")"
+          preprocessed="$(metric preprocessed_cache_hit "$stats")"
+          [[ "$misses" =~ ^[0-9]+$ && "$direct" =~ ^[0-9]+$ && "$preprocessed" =~ ^[0-9]+$ ]]
+          prior="$(cat "$exchange/seed-misses.txt")"
+          [[ "$prior" =~ ^[0-9]+$ ]] && (( prior >= 100 ))
+          hits=$((direct + preprocessed))
+          printf 'Restore: %s compiler hits, %s misses (seed %s), %ss.\n' "$hits" "$misses" "$prior" "$elapsed" | tee -a "$GITHUB_STEP_SUMMARY"
+          (( hits > 0 && misses * 5 <= prior * 4 )) || {
+            echo "::error::Did not demonstrate 20% fewer uncached compiler invocations"
             exit 1
           }
+      - name: Reject a non-exact cache result
+        if: steps.compiler-cache.outputs.cache-hit != 'true'
+        run: exit 1
