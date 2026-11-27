@@ -17,6 +17,7 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
+CHROMIUM_GIT = "https://chromium.googlesource.com/chromium/src.git"
 PACKAGE = "io.github.ktclat.kiwinext.dev"
 GIB = 1024**3
 MIN_BYTES = 100 * 10**9  # Chromium's documented minimum, not an expected final size.
@@ -103,6 +104,30 @@ def verify_remote(sources, fetch=github):
         print(f"Verified {s['role']}: {repo} {s['tag']} / {sha} (source VERSION {s['version']})")
 
 
+def verify_candidate_checkout(src, candidate):
+    def git(*args, text=True):
+        return subprocess.check_output(["git", "-C", str(src), *args], text=text, timeout=45)
+
+    if git("remote", "get-url", "origin").strip() != CHROMIUM_GIT:
+        raise ValueError("Candidate checkout must use the official Chromium Git origin")
+    ref = "refs/tags/" + candidate["tag"]
+    ref_lines = git("ls-remote", "--exit-code", CHROMIUM_GIT, ref).splitlines()
+    if ref_lines != [candidate["commit"] + "\t" + ref]:
+        raise ValueError("Official Chromium tag does not match the pinned commit")
+    if git("rev-parse", "HEAD").strip() != candidate["commit"]:
+        raise ValueError("Candidate checkout HEAD differs from the lock")
+    for path, expected in candidate["blobs"].items():
+        entry = src / path
+        if entry.is_symlink() or not entry.is_file() or not entry.resolve().is_relative_to(src.resolve()):
+            raise ValueError(f"Invalid candidate checkout file: {path}")
+        payload = entry.read_bytes()
+        if git("rev-parse", "HEAD:" + path).strip() != expected or blob_sha(payload) != expected:
+            raise ValueError(f"Candidate checkout differs from the lock: {path}")
+        if path == "chrome/VERSION" and version(payload) != candidate["version"]:
+            raise ValueError("Candidate checkout VERSION differs from the lock")
+    print(f"Verified official Chromium Git tag, HEAD and {len(candidate['blobs'])} checked-out blobs")
+
+
 def check_capacity(path, minimum=MIN_BYTES):
     free = shutil.disk_usage(path).free
     if platform.system() != "Linux" or platform.machine() not in ("x86_64", "AMD64"):
@@ -155,7 +180,10 @@ def prepare(src, arch, candidate):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest="method", required=True)
-    sub.add_parser("verify")
+    verify = sub.add_parser("verify")
+    verify.add_argument("--role", choices=("heritage", "candidate"))
+    checkout = sub.add_parser("verify-checkout")
+    checkout.add_argument("source_root", type=Path)
     pf = sub.add_parser("preflight")
     pf.add_argument("directory", type=Path)
     pf.add_argument("--report-only", action="store_true")
@@ -165,7 +193,9 @@ def main():
     args = p.parse_args()
     sources = read_lock()
     if args.method == "verify":
-        verify_remote(sources)
+        verify_remote([s for s in sources if args.role is None or s["role"] == args.role])
+    elif args.method == "verify-checkout":
+        verify_candidate_checkout(args.source_root.resolve(), sources[1])
     elif args.method == "prepare":
         prepare(args.source_root.resolve(), args.architecture, sources[1])
     else:
@@ -183,5 +213,5 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except (ValueError, OSError, subprocess.CalledProcessError) as exc:
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
         sys.exit(str(exc))

@@ -59,6 +59,27 @@ class BootstrapTests(unittest.TestCase):
             for dangerous in ('disable_sandbox', 'ignore_certificate', 'remote_debugging', 'disable_safe_browsing'):
                 self.assertNotIn(dangerous, text.lower())
 
+    def test_official_checkout_verifies_tag_and_worktree_bytes(self):
+        payload = b"MAJOR=123\nMINOR=0\nBUILD=456\nPATCH=7\n"
+        sha, commit, tag = kiwi.blob_sha(payload), "a" * 40, "123.0.456.7"
+        spec = {"commit": commit, "tag": tag, "version": tag, "blobs": {"chrome/VERSION": sha}}
+        official = [kiwi.CHROMIUM_GIT, f"{commit}\trefs/tags/{tag}\n", commit, sha]
+        with tempfile.TemporaryDirectory() as t:
+            src = Path(t)
+            (src / "chrome").mkdir()
+            version_file = src / "chrome" / "VERSION"
+            version_file.write_bytes(payload)
+            with patch.object(kiwi.subprocess, "check_output", side_effect=official):
+                kiwi.verify_candidate_checkout(src, spec)
+            with patch.object(kiwi.subprocess, "check_output",
+                              side_effect=[kiwi.CHROMIUM_GIT, f"{'b' * 40}\trefs/tags/{tag}\n"]):
+                with self.assertRaisesRegex(ValueError, "tag does not match"):
+                    kiwi.verify_candidate_checkout(src, spec)
+            version_file.write_bytes(payload + b" ")
+            with patch.object(kiwi.subprocess, "check_output", side_effect=official):
+                with self.assertRaisesRegex(ValueError, "differs from the lock: chrome/VERSION"):
+                    kiwi.verify_candidate_checkout(src, spec)
+
     def test_prepare_is_pinned_and_does_not_replace_existing_args(self):
         candidate = kiwi.read_lock()[1]
         with tempfile.TemporaryDirectory() as tmp:

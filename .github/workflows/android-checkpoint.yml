@@ -53,7 +53,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python3 tools/kiwi.py verify
+          python3 tools/kiwi.py verify --role heritage
           tools="$RUNNER_TEMP/depot_tools"
           git init -q "$tools"
           git -C "$tools" fetch --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$DEPOT_TOOLS_REVISION"
@@ -84,7 +84,7 @@ jobs:
           gclient config --name src --unmanaged https://chromium.googlesource.com/chromium/src.git
           printf "\ntarget_os = ['android']\n" >> .gclient
           gclient sync --nohooks --no-history --revision "src@$sha"
-          [[ "$(git -C src rev-parse HEAD)" == "$sha" ]]
+          python3 "$GITHUB_WORKSPACE/tools/kiwi.py" verify-checkout src
           df -h .
       - name: Install pinned Android dependencies and generate GN
         shell: bash
@@ -163,7 +163,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python3 tools/kiwi.py verify
+          python3 tools/kiwi.py verify --role heritage
           tools="$RUNNER_TEMP/depot_tools"
           git init -q "$tools"
           git -C "$tools" fetch --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$DEPOT_TOOLS_REVISION"
@@ -194,7 +194,7 @@ jobs:
           gclient config --name src --unmanaged https://chromium.googlesource.com/chromium/src.git
           printf "\ntarget_os = ['android']\n" >> .gclient
           gclient sync --nohooks --no-history --revision "src@$sha"
-          [[ "$(git -C src rev-parse HEAD)" == "$sha" ]]
+          python3 "$GITHUB_WORKSPACE/tools/kiwi.py" verify-checkout src
           df -h .
       - name: Install pinned Android dependencies and prepare matching args
         shell: bash
