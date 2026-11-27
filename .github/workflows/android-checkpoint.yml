@@ -1,4 +1,4 @@
-name: Kiwi Android APK module-free cache probe
+name: Kiwi Android three-runner APK cache probe
 
 on:
   push:
@@ -15,154 +15,11 @@ concurrency:
 env:
   DEPOT_TOOLS_UPDATE: '0'
   DEPOT_TOOLS_REVISION: ac31fc680158b9ad57e4020e53943a6abd85fcd7
-  CHECKPOINT_KEY: kiwi-apk-nomodules-ccache-v1-${{ github.run_id }}-${{ github.run_attempt }}
+  ORIGINAL_CACHE: kiwi-apk-nomodules-ccache-v1-46043567989-1
+  CHAIN_CACHE: kiwi-apk-chain-v1-${{ github.run_id }}-${{ github.run_attempt }}
 
 jobs:
-  seed:
-    if: github.repository == 'Ktclat/kiwi-next' && github.ref == 'refs/heads/test/android-checkpoint'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 80
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          persist-credentials: false
-      - name: Check capacity on a disposable hosted runner
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ "${RUNNER_ENVIRONMENT:-}" != github-hosted ]]; then
-            echo "Only run disk preparation on a disposable GitHub-hosted runner" >&2
-            exit 1
-          fi
-          echo "Before preparation"
-          df -h "$RUNNER_TEMP"
-          # This specific Linux runner is dedicated to Android Chromium.
-          # Remove only the unrelated preinstalled toolchains, not SDK or user files.
-          sudo rm -rf -- /usr/share/dotnet /opt/ghc /usr/local/swift /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
-          # Chromium sync uses its own pinned NDK. Keep the runner build-tools
-          # for aapt/apksigner and do not remove the whole Android installation.
-          if [[ "$ANDROID_HOME" == /usr/local/lib/android/sdk ]]; then
-            sudo rm -rf -- "$ANDROID_HOME/ndk"
-          fi
-          echo "After preparation"
-          df -h "$RUNNER_TEMP"
-          python3 tools/kiwi.py preflight "$RUNNER_TEMP"
-      - name: Verify and prepare official sources
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          python3 tools/kiwi.py verify --role heritage
-          tools="$RUNNER_TEMP/depot_tools"
-          git init -q "$tools"
-          git -C "$tools" fetch --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$DEPOT_TOOLS_REVISION"
-          git -C "$tools" checkout -q --detach FETCH_HEAD
-          [[ "$(git -C "$tools" rev-parse HEAD)" == "$DEPOT_TOOLS_REVISION" ]]
-          # With DEPOT_TOOLS_UPDATE=0, gclient skips both the git update and
-          # its normal bundled Python setup. Run only the pinned bootstrap.
-          (
-            cd "$tools"
-            base_dir="$tools"
-            set +u # The upstream shell bootstrap uses optional environment variables.
-            source ./cipd_bin_setup.sh
-            cipd_bin_setup
-            source ./bootstrap_python3
-            bootstrap_python3
-          )
-          [[ -s "$tools/python3_bin_reldir.txt" ]]
-          [[ "$(git -C "$tools" rev-parse HEAD)" == "$DEPOT_TOOLS_REVISION" ]]
-          echo "$tools" >> "$GITHUB_PATH"
-      - name: Sync pinned Chromium Android source and dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          sha="$(jq -er '.sources[] | select(.role=="candidate") | .commit' sources.lock.json)"
-          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
-          mkdir "$RUNNER_TEMP/chromium"
-          cd "$RUNNER_TEMP/chromium"
-          gclient config --name src --unmanaged https://chromium.googlesource.com/chromium/src.git
-          printf "\ntarget_os = ['android']\n" >> .gclient
-          gclient sync --nohooks --no-history --revision "src@$sha"
-          python3 "$GITHUB_WORKSPACE/tools/kiwi.py" verify-checkout src
-          df -h .
-      - name: Install pinned Android dependencies and generate GN
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$RUNNER_TEMP/chromium/src"
-          build/install-build-deps.sh --android --no-prompt
-          gclient runhooks
-          python3 "$GITHUB_WORKSPACE/tools/kiwi.py" prepare "$PWD" x64
-          sudo apt-get install --no-install-recommends -y ccache
-          /usr/bin/ccache --version
-          cat >> out/kiwinext-x64/args.gn <<'GN_ARGS'
-          use_siso = false
-          # Test-only: isolate libc++ Clang header-module compilation cost.
-          use_clang_modules = false
-          cc_wrapper = "/usr/bin/ccache"
-          GN_ARGS
-          gn gen out/kiwinext-x64 --fail-on-unused-args
-
-      - name: Time-box the real APK build and save compiler results
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$RUNNER_TEMP/chromium/src"
-          out=out/kiwinext-x64
-          exchange="$RUNNER_TEMP/kiwi-checkpoint"
-          export CCACHE_DIR="$RUNNER_TEMP/kiwi-ccache"
-          export CCACHE_MAXSIZE=2Gi
-          export CCACHE_COMPILERCHECK=content
-          export CCACHE_CONFIGPATH=/dev/null
-          mkdir "$CCACHE_DIR"
-          [[ ! -e "$out/.ninja_log" ]]
-          metric() { awk -v key="$1" '$1 == key {print $2}' "$2"; }
-          fingerprint() {
-            printf '%s\n' "$(pwd -P)" "${ImageVersion:?}" "$(git rev-parse HEAD)" "$DEPOT_TOOLS_REVISION" "$(sha256sum "$out/args.gn")"
-            /usr/bin/ccache --version
-          }
-          mkdir "$exchange"
-          /usr/bin/ccache --zero-stats
-          log="$RUNNER_TEMP/kiwi-ccache-build.log"
-          start=$SECONDS
-          rc=0
-          timeout --signal=INT --kill-after=30s 30m autoninja -C "$out" chrome_public_apk > "$log" 2>&1 || rc=$?
-          elapsed=$((SECONDS-start))
-          tail -n 20 "$log"
-          if (( rc == 0 )); then
-            test -s "$out/apks/ChromePublic.apk"
-          elif (( rc != 124 )) || ! grep -Fq "interrupted by user" "$log"; then
-            echo "::error::APK build failed, rather than reaching the planned cutoff (exit $rc)"
-            exit 1
-          fi
-          test -s "$out/.ninja_log"
-          stats="$RUNNER_TEMP/ccache-stats.tsv"
-          /usr/bin/ccache --print-stats > "$stats"
-          /usr/bin/ccache --show-stats --verbose
-          misses="$(metric cache_miss "$stats")"
-          direct="$(metric direct_cache_hit "$stats")"
-          preprocessed="$(metric preprocessed_cache_hit "$stats")"
-          [[ "$misses" =~ ^[0-9]+$ && "$direct" =~ ^[0-9]+$ && "$preprocessed" =~ ^[0-9]+$ ]]
-          (( misses >= 100 )) || { echo "::error::Fewer than 100 cacheable cold compiler calls"; exit 1; }
-          cp "$out/.ninja_log" "$exchange/seed.ninja_log"
-          read -r bytes _ < <(du -sb "$CCACHE_DIR")
-          printf 'Local compiler cache: %s bytes\n' "$bytes"
-          (( bytes > 10000 && bytes <= 2560 * 1024 * 1024 ))
-          tar --format=posix -C "$CCACHE_DIR" -cf - . | zstd -q -T2 -3 -o "$exchange/ccache.tar.zst"
-          compressed="$(stat -c %s "$exchange/ccache.tar.zst")"
-          (( compressed <= 2560 * 1024 * 1024 ))
-          fingerprint > "$exchange/inputs.txt"
-          printf '%s\n' "$misses" > "$exchange/seed-misses.txt"
-          (cd "$exchange" && sha256sum ccache.tar.zst seed.ninja_log inputs.txt seed-misses.txt > SHA256SUMS)
-          printf 'Seed: %s compiler misses in %ss; archive %s bytes.\n' "$misses" "$elapsed" "$compressed" | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: Save bounded compiler cache
-        uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7
-        with:
-          path: ${{ runner.temp }}/kiwi-checkpoint
-          key: ${{ env.CHECKPOINT_KEY }}
-  restore:
-    needs: seed
+  second:
     if: github.repository == 'Ktclat/kiwi-next' && github.ref == 'refs/heads/test/android-checkpoint'
     runs-on: ubuntu-24.04
     timeout-minutes: 80
@@ -253,7 +110,7 @@ jobs:
         uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7
         with:
           path: ${{ runner.temp }}/kiwi-checkpoint
-          key: ${{ env.CHECKPOINT_KEY }}
+          key: ${{ env.ORIGINAL_CACHE }}
           fail-on-cache-miss: true
       - name: Compare fresh-runner APK progress at the same time budget
         if: steps.compiler-cache.outputs.cache-hit == 'true'
@@ -302,10 +159,211 @@ jobs:
           [[ "$prior" =~ ^[0-9]+$ ]] && (( prior >= 100 ))
           hits=$((direct + preprocessed))
           read -r bytes _ < <(du -sb "$CCACHE_DIR")
-          printf 'Restore: %s compiler hits, %s misses in %ss (seed had %s misses); cache now %s bytes.\n' "$hits" "$misses" "$elapsed" "$prior" "$bytes" | tee -a "$GITHUB_STEP_SUMMARY"
+          printf 'Restore: %s compiler hits, %s misses in %ss (previous runner candidate compiler calls: %s); cache now %s bytes.\n' "$hits" "$misses" "$elapsed" "$prior" "$bytes" | tee -a "$GITHUB_STEP_SUMMARY"
           python3 "$GITHUB_WORKSPACE/tools/compare_ninja_progress.py" \
             "$exchange/seed.ninja_log" "$out/.ninja_log" | tee -a "$GITHUB_STEP_SUMMARY"
-          (( hits > 0 )) || { echo "::error::No cross-run APK compiler reuse"; exit 1; }
+          (( hits * 10 >= prior * 9 )) || { echo "::error::Second runner did not replay 90% of the original compiler calls"; exit 1; }
       - name: Reject a non-exact cache result
         if: steps.compiler-cache.outputs.cache-hit != 'true'
         run: exit 1
+      - name: Pack the verified compiler cache and new progress
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/chromium/src"
+          out=out/kiwinext-x64
+          exchange="$RUNNER_TEMP/kiwi-checkpoint"
+          cache="$RUNNER_TEMP/kiwi-ccache"
+          read -r bytes _ < <(du -sb "$cache")
+          (( bytes > 10000 && bytes <= 2560 * 1024 * 1024 ))
+          compiled="$(awk '$1 == "cache_miss" || $1 == "direct_cache_hit" || $1 == "preprocessed_cache_hit" {sum += $2} END {print sum+0}' "$RUNNER_TEMP/ccache-stats.tsv")"
+          [[ "$compiled" =~ ^[0-9]+$ ]] && (( compiled >= 100 ))
+          tar --format=posix -C "$cache" -cf - . | zstd -q -T2 -3 -o "$exchange/ccache.next.tar.zst"
+          compressed="$(stat -c %s "$exchange/ccache.next.tar.zst")"
+          (( compressed <= 2560 * 1024 * 1024 ))
+          mv -- "$exchange/ccache.next.tar.zst" "$exchange/ccache.tar.zst"
+          cp -- "$out/.ninja_log" "$exchange/seed.ninja_log"
+          printf '%s\n' "$compiled" > "$exchange/seed-misses.txt"
+          (cd "$exchange" && sha256sum ccache.tar.zst seed.ninja_log inputs.txt seed-misses.txt > SHA256SUMS)
+          printf 'Forwarding %s compiler results/hits as candidate entries; archive %s bytes.\n' "$compiled" "$compressed"
+      - name: Save bounded compiler cache for the next runner
+        uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7
+        with:
+          path: ${{ runner.temp }}/kiwi-checkpoint
+          key: ${{ env.CHAIN_CACHE }}-second
+  third:
+    needs: second
+    if: github.repository == 'Ktclat/kiwi-next' && github.ref == 'refs/heads/test/android-checkpoint'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 80
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Check capacity on a disposable hosted runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${RUNNER_ENVIRONMENT:-}" != github-hosted ]]; then
+            echo "Only run disk preparation on a disposable GitHub-hosted runner" >&2
+            exit 1
+          fi
+          echo "Before preparation"
+          df -h "$RUNNER_TEMP"
+          # This specific Linux runner is dedicated to Android Chromium.
+          # Remove only the unrelated preinstalled toolchains, not SDK or user files.
+          sudo rm -rf -- /usr/share/dotnet /opt/ghc /usr/local/swift /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          # Chromium sync uses its own pinned NDK. Keep the runner build-tools
+          # for aapt/apksigner and do not remove the whole Android installation.
+          if [[ "$ANDROID_HOME" == /usr/local/lib/android/sdk ]]; then
+            sudo rm -rf -- "$ANDROID_HOME/ndk"
+          fi
+          echo "After preparation"
+          df -h "$RUNNER_TEMP"
+          python3 tools/kiwi.py preflight "$RUNNER_TEMP"
+      - name: Verify and prepare official sources
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 tools/kiwi.py verify --role heritage
+          tools="$RUNNER_TEMP/depot_tools"
+          git init -q "$tools"
+          git -C "$tools" fetch --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$DEPOT_TOOLS_REVISION"
+          git -C "$tools" checkout -q --detach FETCH_HEAD
+          [[ "$(git -C "$tools" rev-parse HEAD)" == "$DEPOT_TOOLS_REVISION" ]]
+          # With DEPOT_TOOLS_UPDATE=0, gclient skips both the git update and
+          # its normal bundled Python setup. Run only the pinned bootstrap.
+          (
+            cd "$tools"
+            base_dir="$tools"
+            set +u # The upstream shell bootstrap uses optional environment variables.
+            source ./cipd_bin_setup.sh
+            cipd_bin_setup
+            source ./bootstrap_python3
+            bootstrap_python3
+          )
+          [[ -s "$tools/python3_bin_reldir.txt" ]]
+          [[ "$(git -C "$tools" rev-parse HEAD)" == "$DEPOT_TOOLS_REVISION" ]]
+          echo "$tools" >> "$GITHUB_PATH"
+      - name: Sync pinned Chromium Android source and dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(jq -er '.sources[] | select(.role=="candidate") | .commit' sources.lock.json)"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          mkdir "$RUNNER_TEMP/chromium"
+          cd "$RUNNER_TEMP/chromium"
+          gclient config --name src --unmanaged https://chromium.googlesource.com/chromium/src.git
+          printf "\ntarget_os = ['android']\n" >> .gclient
+          gclient sync --nohooks --no-history --revision "src@$sha"
+          python3 "$GITHUB_WORKSPACE/tools/kiwi.py" verify-checkout src
+          df -h .
+      - name: Install pinned Android dependencies and generate GN
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/chromium/src"
+          build/install-build-deps.sh --android --no-prompt
+          gclient runhooks
+          python3 "$GITHUB_WORKSPACE/tools/kiwi.py" prepare "$PWD" x64
+
+          sudo apt-get install --no-install-recommends -y ccache
+          /usr/bin/ccache --version
+          cat >> out/kiwinext-x64/args.gn <<'GN_ARGS'
+          use_siso = false
+          # Test-only: isolate libc++ Clang header-module compilation cost.
+          use_clang_modules = false
+          cc_wrapper = "/usr/bin/ccache"
+          GN_ARGS
+          gn gen out/kiwinext-x64 --fail-on-unused-args
+      - name: Restore this exact compiler cache
+        id: compiler-cache
+        uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7
+        with:
+          path: ${{ runner.temp }}/kiwi-checkpoint
+          key: ${{ env.CHAIN_CACHE }}-second
+          fail-on-cache-miss: true
+      - name: Compare fresh-runner APK progress at the same time budget
+        if: steps.compiler-cache.outputs.cache-hit == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/chromium/src"
+          out=out/kiwinext-x64
+          exchange="$RUNNER_TEMP/kiwi-checkpoint"
+          export CCACHE_DIR="$RUNNER_TEMP/kiwi-ccache"
+          export CCACHE_MAXSIZE=2Gi
+          export CCACHE_COMPILERCHECK=content
+          export CCACHE_CONFIGPATH=/dev/null
+          mkdir "$CCACHE_DIR"
+          [[ ! -e "$out/.ninja_log" ]]
+          metric() { awk -v key="$1" '$1 == key {print $2}' "$2"; }
+          fingerprint() {
+            printf '%s\n' "$(pwd -P)" "${ImageVersion:?}" "$(git rev-parse HEAD)" "$DEPOT_TOOLS_REVISION" "$(sha256sum "$out/args.gn")"
+            /usr/bin/ccache --version
+          }
+          fingerprint | cmp - "$exchange/inputs.txt"
+          (cd "$exchange" && sha256sum -c SHA256SUMS)
+          zstd -qdc "$exchange/ccache.tar.zst" | tar -xf - -C "$CCACHE_DIR" --no-same-owner
+          /usr/bin/ccache --zero-stats
+          log="$RUNNER_TEMP/kiwi-ccache-build.log"
+          start=$SECONDS
+          rc=0
+          timeout --signal=INT --kill-after=30s 30m autoninja -C "$out" chrome_public_apk > "$log" 2>&1 || rc=$?
+          elapsed=$((SECONDS-start))
+          tail -n 20 "$log"
+          if (( rc == 0 )); then
+            test -s "$out/apks/ChromePublic.apk"
+          elif (( rc != 124 )) || ! grep -Fq "interrupted by user" "$log"; then
+            echo "::error::APK build failed, rather than reaching the planned cutoff (exit $rc)"
+            exit 1
+          fi
+          test -s "$out/.ninja_log"
+          stats="$RUNNER_TEMP/ccache-stats.tsv"
+          /usr/bin/ccache --print-stats > "$stats"
+          /usr/bin/ccache --show-stats --verbose
+          misses="$(metric cache_miss "$stats")"
+          direct="$(metric direct_cache_hit "$stats")"
+          preprocessed="$(metric preprocessed_cache_hit "$stats")"
+          [[ "$misses" =~ ^[0-9]+$ && "$direct" =~ ^[0-9]+$ && "$preprocessed" =~ ^[0-9]+$ ]]
+          prior="$(cat "$exchange/seed-misses.txt")"
+          [[ "$prior" =~ ^[0-9]+$ ]] && (( prior >= 100 ))
+          hits=$((direct + preprocessed))
+          read -r bytes _ < <(du -sb "$CCACHE_DIR")
+          printf 'Restore: %s compiler hits, %s misses in %ss (previous runner candidate compiler calls: %s); cache now %s bytes.\n' "$hits" "$misses" "$elapsed" "$prior" "$bytes" | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/tools/compare_ninja_progress.py" \
+            "$exchange/seed.ninja_log" "$out/.ninja_log" | tee -a "$GITHUB_STEP_SUMMARY"
+          (( hits >= 5576 && hits * 4 >= prior * 3 )) || {
+            echo "::error::Third runner did not reuse enough of the second runner's expanded cache"
+            exit 1
+          }
+      - name: Reject a non-exact cache result
+        if: steps.compiler-cache.outputs.cache-hit != 'true'
+        run: exit 1
+      - name: Pack the verified compiler cache and new progress
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/chromium/src"
+          out=out/kiwinext-x64
+          exchange="$RUNNER_TEMP/kiwi-checkpoint"
+          cache="$RUNNER_TEMP/kiwi-ccache"
+          read -r bytes _ < <(du -sb "$cache")
+          (( bytes > 10000 && bytes <= 2560 * 1024 * 1024 ))
+          compiled="$(awk '$1 == "cache_miss" || $1 == "direct_cache_hit" || $1 == "preprocessed_cache_hit" {sum += $2} END {print sum+0}' "$RUNNER_TEMP/ccache-stats.tsv")"
+          [[ "$compiled" =~ ^[0-9]+$ ]] && (( compiled >= 100 ))
+          tar --format=posix -C "$cache" -cf - . | zstd -q -T2 -3 -o "$exchange/ccache.next.tar.zst"
+          compressed="$(stat -c %s "$exchange/ccache.next.tar.zst")"
+          (( compressed <= 2560 * 1024 * 1024 ))
+          mv -- "$exchange/ccache.next.tar.zst" "$exchange/ccache.tar.zst"
+          cp -- "$out/.ninja_log" "$exchange/seed.ninja_log"
+          printf '%s\n' "$compiled" > "$exchange/seed-misses.txt"
+          (cd "$exchange" && sha256sum ccache.tar.zst seed.ninja_log inputs.txt seed-misses.txt > SHA256SUMS)
+          printf 'Forwarding %s compiler results/hits as candidate entries; archive %s bytes.\n' "$compiled" "$compressed"
+      - name: Save bounded compiler cache for the next runner
+        uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7
+        with:
+          path: ${{ runner.temp }}/kiwi-checkpoint
+          key: ${{ env.CHAIN_CACHE }}-third
