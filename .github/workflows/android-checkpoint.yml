@@ -1,0 +1,243 @@
+name: Kiwi Android checkpoint probe
+
+on:
+  push:
+    branches: [test/android-checkpoint]
+    paths: ['.github/workflows/android-checkpoint.yml']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kiwi-android-checkpoint
+  cancel-in-progress: false
+
+env:
+  DEPOT_TOOLS_UPDATE: '0'
+  DEPOT_TOOLS_REVISION: ac31fc680158b9ad57e4020e53943a6abd85fcd7
+  CHECKPOINT_KEY: kiwi-probe-v1-${{ github.run_id }}-${{ github.run_attempt }}
+
+jobs:
+  seed:
+    if: github.repository == 'Ktclat/kiwi-next' && github.ref == 'refs/heads/test/android-checkpoint'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Check capacity on a disposable hosted runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${RUNNER_ENVIRONMENT:-}" != github-hosted ]]; then
+            echo "Only run disk preparation on a disposable GitHub-hosted runner" >&2
+            exit 1
+          fi
+          echo "Before preparation"
+          df -h "$RUNNER_TEMP"
+          # This specific Linux runner is dedicated to Android Chromium.
+          # Remove only the unrelated preinstalled toolchains, not SDK or user files.
+          sudo rm -rf -- /usr/share/dotnet /opt/ghc /usr/local/swift /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          # Chromium sync uses its own pinned NDK. Keep the runner build-tools
+          # for aapt/apksigner and do not remove the whole Android installation.
+          if [[ "$ANDROID_HOME" == /usr/local/lib/android/sdk ]]; then
+            sudo rm -rf -- "$ANDROID_HOME/ndk"
+          fi
+          echo "After preparation"
+          df -h "$RUNNER_TEMP"
+          python3 tools/kiwi.py preflight "$RUNNER_TEMP"
+      - name: Verify and prepare official sources
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 tools/kiwi.py verify
+          tools="$RUNNER_TEMP/depot_tools"
+          git init -q "$tools"
+          git -C "$tools" fetch --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$DEPOT_TOOLS_REVISION"
+          git -C "$tools" checkout -q --detach FETCH_HEAD
+          [[ "$(git -C "$tools" rev-parse HEAD)" == "$DEPOT_TOOLS_REVISION" ]]
+          # With DEPOT_TOOLS_UPDATE=0, gclient skips both the git update and
+          # its normal bundled Python setup. Run only the pinned bootstrap.
+          (
+            cd "$tools"
+            base_dir="$tools"
+            set +u # The upstream shell bootstrap uses optional environment variables.
+            source ./cipd_bin_setup.sh
+            cipd_bin_setup
+            source ./bootstrap_python3
+            bootstrap_python3
+          )
+          [[ -s "$tools/python3_bin_reldir.txt" ]]
+          [[ "$(git -C "$tools" rev-parse HEAD)" == "$DEPOT_TOOLS_REVISION" ]]
+          echo "$tools" >> "$GITHUB_PATH"
+      - name: Sync pinned Chromium Android source and dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(jq -er '.sources[] | select(.role=="candidate") | .commit' sources.lock.json)"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          mkdir "$RUNNER_TEMP/chromium"
+          cd "$RUNNER_TEMP/chromium"
+          gclient config --name src --unmanaged https://chromium.googlesource.com/chromium/src.git
+          printf "\ntarget_os = ['android']\n" >> .gclient
+          gclient sync --nohooks --no-history --revision "src@$sha"
+          [[ "$(git -C src rev-parse HEAD)" == "$sha" ]]
+          df -h .
+      - name: Install pinned Android dependencies and generate GN
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/chromium/src"
+          build/install-build-deps.sh --android --no-prompt
+          gclient runhooks
+          python3 "$GITHUB_WORKSPACE/tools/kiwi.py" prepare "$PWD" x64
+          gn gen out/kiwinext-x64 --fail-on-unused-args
+
+      - name: Build a real Android Chromium library and record objects
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/chromium/src"
+          out=out/kiwinext-x64
+          gn desc "$out" //base:base type
+          timeout --kill-after=30s 45m autoninja -C "$out" base:base > "$RUNNER_TEMP/kiwi-seed.log" 2>&1 || {
+            rc=$?
+            tail -n 60 "$RUNNER_TEMP/kiwi-seed.log"
+            exit "$rc"
+          }
+          tail -n 5 "$RUNNER_TEMP/kiwi-seed.log"
+          checkpoint="$RUNNER_TEMP/kiwi-checkpoint"
+          mkdir "$checkpoint"
+          start=$SECONDS
+          # Save the full generated output, including dotfiles, but no checkout or credentials.
+          tar -C out -cf - kiwinext-x64 | zstd -q -T2 -3 -o "$checkpoint/output.tar.zst"
+          bytes="$(stat -c %s "$checkpoint/output.tar.zst")"
+          printf 'Compressed size: %s bytes; archive time: %ss\n' "$bytes" "$((SECONDS-start))"
+          (( bytes <= 192 * 1024 * 1024 )) || { echo "Probe exceeded its 192 MiB cache budget"; exit 1; }
+          find "$out/obj/base" -type f -name '*.o' -printf '%p\t%T@\t%s\n' | LC_ALL=C sort > "$checkpoint/objects.tsv"
+          [[ "$(wc -l < "$checkpoint/objects.tsv")" -ge 5 ]]
+          printf '%s\n' "$(pwd -P)" "${ImageVersion:?}" "$(git rev-parse HEAD)" "$DEPOT_TOOLS_REVISION" "$(sha256sum "$out/args.gn")" > "$checkpoint/inputs.txt"
+          (cd "$checkpoint" && sha256sum output.tar.zst > SHA256SUMS)
+          printf 'Seed: %s compiled objects, %s compressed bytes.\n' "$(wc -l < "$checkpoint/objects.tsv")" "$bytes" >> "$GITHUB_STEP_SUMMARY"
+      - name: Save this run's checkpoint only
+        uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7
+        with:
+          path: ${{ runner.temp }}/kiwi-checkpoint
+          key: ${{ env.CHECKPOINT_KEY }}
+  restore:
+    needs: seed
+    if: github.repository == 'Ktclat/kiwi-next' && github.ref == 'refs/heads/test/android-checkpoint'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Check capacity on a disposable hosted runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${RUNNER_ENVIRONMENT:-}" != github-hosted ]]; then
+            echo "Only run disk preparation on a disposable GitHub-hosted runner" >&2
+            exit 1
+          fi
+          echo "Before preparation"
+          df -h "$RUNNER_TEMP"
+          # This specific Linux runner is dedicated to Android Chromium.
+          # Remove only the unrelated preinstalled toolchains, not SDK or user files.
+          sudo rm -rf -- /usr/share/dotnet /opt/ghc /usr/local/swift /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          # Chromium sync uses its own pinned NDK. Keep the runner build-tools
+          # for aapt/apksigner and do not remove the whole Android installation.
+          if [[ "$ANDROID_HOME" == /usr/local/lib/android/sdk ]]; then
+            sudo rm -rf -- "$ANDROID_HOME/ndk"
+          fi
+          echo "After preparation"
+          df -h "$RUNNER_TEMP"
+          python3 tools/kiwi.py preflight "$RUNNER_TEMP"
+      - name: Verify and prepare official sources
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 tools/kiwi.py verify
+          tools="$RUNNER_TEMP/depot_tools"
+          git init -q "$tools"
+          git -C "$tools" fetch --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$DEPOT_TOOLS_REVISION"
+          git -C "$tools" checkout -q --detach FETCH_HEAD
+          [[ "$(git -C "$tools" rev-parse HEAD)" == "$DEPOT_TOOLS_REVISION" ]]
+          # With DEPOT_TOOLS_UPDATE=0, gclient skips both the git update and
+          # its normal bundled Python setup. Run only the pinned bootstrap.
+          (
+            cd "$tools"
+            base_dir="$tools"
+            set +u # The upstream shell bootstrap uses optional environment variables.
+            source ./cipd_bin_setup.sh
+            cipd_bin_setup
+            source ./bootstrap_python3
+            bootstrap_python3
+          )
+          [[ -s "$tools/python3_bin_reldir.txt" ]]
+          [[ "$(git -C "$tools" rev-parse HEAD)" == "$DEPOT_TOOLS_REVISION" ]]
+          echo "$tools" >> "$GITHUB_PATH"
+      - name: Sync pinned Chromium Android source and dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(jq -er '.sources[] | select(.role=="candidate") | .commit' sources.lock.json)"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          mkdir "$RUNNER_TEMP/chromium"
+          cd "$RUNNER_TEMP/chromium"
+          gclient config --name src --unmanaged https://chromium.googlesource.com/chromium/src.git
+          printf "\ntarget_os = ['android']\n" >> .gclient
+          gclient sync --nohooks --no-history --revision "src@$sha"
+          [[ "$(git -C src rev-parse HEAD)" == "$sha" ]]
+          df -h .
+      - name: Install pinned Android dependencies and prepare matching args
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/chromium/src"
+          build/install-build-deps.sh --android --no-prompt
+          gclient runhooks
+          python3 "$GITHUB_WORKSPACE/tools/kiwi.py" prepare "$PWD" x64
+
+      - name: Restore this run's exact checkpoint
+        uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7
+        id: cache
+        with:
+          path: ${{ runner.temp }}/kiwi-checkpoint
+          key: ${{ env.CHECKPOINT_KEY }}
+          fail-on-cache-miss: true
+      - name: Require unchanged compiled object state on the fresh runner
+        shell: bash
+        env:
+          EXACT_HIT: ${{ steps.cache.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          [[ "$EXACT_HIT" == true ]]
+          cd "$RUNNER_TEMP/chromium/src"
+          out=out/kiwinext-x64
+          checkpoint="$RUNNER_TEMP/kiwi-checkpoint"
+          printf '%s\n' "$(pwd -P)" "${ImageVersion:?}" "$(git rev-parse HEAD)" "$DEPOT_TOOLS_REVISION" "$(sha256sum "$out/args.gn")" | cmp - "$checkpoint/inputs.txt"
+          (cd "$checkpoint" && sha256sum -c SHA256SUMS)
+          start=$SECONDS
+          zstd -qdc "$checkpoint/output.tar.zst" | tar -xf - -C out --no-same-owner
+          printf 'Extraction time: %ss\n' "$((SECONDS-start))"
+          objects() { find "$out/obj/base" -type f -name '*.o' -printf '%p\t%T@\t%s\n' | LC_ALL=C sort; }
+          # Compare mtimes and sizes before and after, not merely whether cache transport worked.
+          objects > "$RUNNER_TEMP/kiwi-before.tsv"
+          cmp "$checkpoint/objects.tsv" "$RUNNER_TEMP/kiwi-before.tsv"
+          start=$SECONDS
+          timeout --kill-after=30s 15m autoninja -C "$out" base:base > "$RUNNER_TEMP/kiwi-restore.log" 2>&1 || {
+            rc=$?
+            tail -n 60 "$RUNNER_TEMP/kiwi-restore.log"
+            exit "$rc"
+          }
+          tail -n 15 "$RUNNER_TEMP/kiwi-restore.log"
+          objects > "$RUNNER_TEMP/kiwi-after.tsv"
+          cmp "$checkpoint/objects.tsv" "$RUNNER_TEMP/kiwi-after.tsv"
+          printf 'Exact cache hit; all %s compiled base objects unchanged after %ss rebuild check.\n' "$(wc -l < "$checkpoint/objects.tsv")" "$((SECONDS-start))" >> "$GITHUB_STEP_SUMMARY"
