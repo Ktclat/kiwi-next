@@ -1,4 +1,4 @@
-name: Kiwi Android APK continuation probe
+name: Kiwi Android APK module-free cache probe
 
 on:
   push:
@@ -15,7 +15,7 @@ concurrency:
 env:
   DEPOT_TOOLS_UPDATE: '0'
   DEPOT_TOOLS_REVISION: ac31fc680158b9ad57e4020e53943a6abd85fcd7
-  CHECKPOINT_KEY: kiwi-apk-ccache-v1-${{ github.run_id }}-${{ github.run_attempt }}
+  CHECKPOINT_KEY: kiwi-apk-nomodules-ccache-v1-${{ github.run_id }}-${{ github.run_attempt }}
 
 jobs:
   seed:
@@ -98,6 +98,8 @@ jobs:
           /usr/bin/ccache --version
           cat >> out/kiwinext-x64/args.gn <<'GN_ARGS'
           use_siso = false
+          # Test-only: isolate libc++ Clang header-module compilation cost.
+          use_clang_modules = false
           cc_wrapper = "/usr/bin/ccache"
           GN_ARGS
           gn gen out/kiwinext-x64 --fail-on-unused-args
@@ -241,6 +243,8 @@ jobs:
           /usr/bin/ccache --version
           cat >> out/kiwinext-x64/args.gn <<'GN_ARGS'
           use_siso = false
+          # Test-only: isolate libc++ Clang header-module compilation cost.
+          use_clang_modules = false
           cc_wrapper = "/usr/bin/ccache"
           GN_ARGS
           gn gen out/kiwinext-x64 --fail-on-unused-args
