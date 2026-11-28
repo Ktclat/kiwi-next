@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: kiwi-android-checkpoint
@@ -15,7 +16,7 @@ concurrency:
 env:
   DEPOT_TOOLS_UPDATE: '0'
   DEPOT_TOOLS_REVISION: ac31fc680158b9ad57e4020e53943a6abd85fcd7
-  ORIGINAL_CACHE: kiwi-apk-extended-v1-46066631639-1
+  ORIGINAL_CACHE: kiwi-apk-extended-v1-46093054194-1
   CHAIN_CACHE: kiwi-apk-extended-v1-${{ github.run_id }}-${{ github.run_attempt }}
 
 jobs:
@@ -112,7 +113,7 @@ jobs:
           path: ${{ runner.temp }}/kiwi-checkpoint
           key: ${{ env.ORIGINAL_CACHE }}
           fail-on-cache-miss: true
-      - name: Build the APK from the verified 4-hour checkpoint
+      - name: Build the APK from the verified browser-generation checkpoint
         id: build
         if: steps.compiler-cache.outputs.cache-hit == 'true'
         shell: bash
@@ -122,7 +123,7 @@ jobs:
           out=out/kiwinext-x64
           exchange="$RUNNER_TEMP/kiwi-checkpoint"
           export CCACHE_DIR="$RUNNER_TEMP/kiwi-ccache"
-          export CCACHE_MAXSIZE=3Gi
+          export CCACHE_MAXSIZE=4Gi
           export CCACHE_COMPILERCHECK=content
           export CCACHE_CONFIGPATH=/dev/null
           mkdir "$CCACHE_DIR"
@@ -236,17 +237,38 @@ jobs:
           exchange="$RUNNER_TEMP/kiwi-checkpoint"
           cache="$RUNNER_TEMP/kiwi-ccache"
           read -r bytes _ < <(du -sb "$cache")
-          (( bytes > 10000 && bytes <= 3584 * 1024 * 1024 ))
+          (( bytes > 10000 && bytes <= 4352 * 1024 * 1024 ))
           compiled="$(awk '$1 == "cache_miss" || $1 == "direct_cache_hit" || $1 == "preprocessed_cache_hit" {sum += $2} END {print sum+0}' "$RUNNER_TEMP/ccache-stats.tsv")"
           [[ "$compiled" =~ ^[0-9]+$ ]] && (( compiled >= 100 ))
           tar --format=posix -C "$cache" -cf - . | zstd -q -T2 -3 -o "$exchange/ccache.next.tar.zst"
           compressed="$(stat -c %s "$exchange/ccache.next.tar.zst")"
-          (( compressed <= 3584 * 1024 * 1024 ))
+          (( compressed <= 4352 * 1024 * 1024 ))
           mv -- "$exchange/ccache.next.tar.zst" "$exchange/ccache.tar.zst"
           cp -- "$out/.ninja_log" "$exchange/seed.ninja_log"
           printf '%s\n' "$compiled" > "$exchange/seed-misses.txt"
           (cd "$exchange" && sha256sum ccache.tar.zst seed.ninja_log inputs.txt seed-misses.txt > SHA256SUMS)
           printf 'Forwarding %s compiler results/hits as candidate entries; archive %s bytes.\n' "$compiled" "$compressed"
+      - name: Check repository cache headroom before saving
+        if: steps.build.outputs.outcome == 'partial'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Fail closed for a partial save. A finished APK never depends on cache quota.
+          usage="$(curl --fail --silent --show-error --retry 2 --retry-delay 4 --max-time 15 \
+            -H 'Accept: application/vnd.github+json' -H "Authorization: Bearer $GH_TOKEN" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/cache/usage")"
+          used="$(jq -er --arg repo "$GITHUB_REPOSITORY" \
+            'select(.full_name == $repo) | .active_caches_size_in_bytes | select(type == "number" and . >= 0)' <<<"$usage")"
+          [[ "$used" =~ ^[0-9]{1,12}$ ]]
+          read -r packed _ < <(du -sb "$RUNNER_TEMP/kiwi-checkpoint")
+          printf 'Reported repository cache: %s bytes; pending archive and metadata: %s bytes.\n' "$used" "$packed"
+          # Leave 500 MB for metering delay and transport overhead below 10 GB.
+          (( used + packed <= 9500000000 )) || {
+            echo "::error::Saving the new checkpoint could exceed the free cache allowance"
+            exit 1
+          }
       - name: Save bounded compiler cache for the next runner
         if: steps.build.outputs.outcome == 'partial'
         uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7
