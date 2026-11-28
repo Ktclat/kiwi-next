@@ -1,9 +1,9 @@
-name: Kiwi Android cached APK build
+name: Kiwi Android cached APK signing investigation
 
 on:
   push:
     branches: [test/android-checkpoint]
-    paths: ['.github/workflows/android-checkpoint.yml', 'tools/compare_ninja_progress.py']
+    paths: ['.github/workflows/android-checkpoint.yml', 'tools/compare_ninja_progress.py', 'tools/check_apk_signer.py']
 
 permissions:
   contents: read
@@ -106,6 +106,24 @@ jobs:
           cc_wrapper = "/usr/bin/ccache"
           GN_ARGS
           gn gen out/kiwinext-x64 --fail-on-unused-args
+      - name: Check the actual pinned build's engineering keystore before compiling
+        shell: bash
+        env:
+          LC_ALL: C
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/chromium/src"
+          key=build/android/chromium-debug.keystore
+          [[ "$(git hash-object "$key")" == "$(git rev-parse "HEAD:$key")" ]]
+          expected="$(python3 "$GITHUB_WORKSPACE/tools/check_apk_signer.py" --expected)"
+          # This is the public upstream engineering key, not a user credential.
+          keytool -exportcert -keystore "$key" -storepass chromium -alias chromiumdebugkey -file "$RUNNER_TEMP/chromium-debug-cert.der"
+          read -r actual _ < <(sha256sum "$RUNNER_TEMP/chromium-debug-cert.der")
+          printf 'Pinned source keystore certificate SHA-256: %s\n' "$actual"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "::error::The verified upstream engineering keystore differs from the expected certificate"
+            exit 1
+          fi
       - name: Restore this exact compiler cache
         id: compiler-cache
         uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7
@@ -165,6 +183,7 @@ jobs:
           if (( rc == 0 )); then
             test -s "$out/apks/ChromePublic.apk"
             /usr/bin/ccache --show-stats --verbose
+            /usr/bin/ccache --print-stats > "$RUNNER_TEMP/ccache-stats.tsv"
             echo 'outcome=apk' >> "$GITHUB_OUTPUT"
             printf 'APK compiled in %ss; package verification follows.\n' "$elapsed" | tee -a "$GITHUB_STEP_SUMMARY"
             exit 0
@@ -197,6 +216,7 @@ jobs:
         if: steps.compiler-cache.outputs.cache-hit != 'true'
         run: exit 1
       - name: Verify package identity, ABI, signature and digest
+        id: verify
         if: steps.build.outputs.outcome == 'apk'
         shell: bash
         run: |
@@ -208,8 +228,21 @@ jobs:
           "$sdk_tools/aapt" dump badging "$apk" > "$RUNNER_TEMP/apk-details.txt"
           grep -F "package: name='io.github.ktclat.kiwinext.dev'" "$RUNNER_TEMP/apk-details.txt"
           grep -F "native-code: 'x86_64'" "$RUNNER_TEMP/apk-details.txt"
-          "$sdk_tools/apksigner" verify --print-certs "$apk" >> "$RUNNER_TEMP/apk-details.txt"
-          grep -Fx "Signer #1 certificate SHA-256 digest: 32a2fc74d731105859e5a85df16d95f102d85b22099b8064c5d8915c61dad1e0" "$RUNNER_TEMP/apk-details.txt"
+          printf 'Verifier directory: %s\n' "$sdk_tools"
+          "$sdk_tools/apksigner" version
+          set +e
+          LC_ALL=C "$sdk_tools/apksigner" verify --verbose --print-certs "$apk" 2>&1 | tee "$RUNNER_TEMP/apk-signature.txt"
+          sig_status=("${PIPESTATUS[@]}")
+          set -e
+          if (( sig_status[0] != 0 || sig_status[1] != 0 )); then
+            echo "::error::APK signature verifier exit ${sig_status[0]}; transcript write exit ${sig_status[1]}"
+            exit 1
+          fi
+          if ! python3 "$GITHUB_WORKSPACE/tools/check_apk_signer.py" "$RUNNER_TEMP/apk-signature.txt"; then
+            echo "::error::Cryptographic verification passed, but the reported signer did not match the pinned certificate"
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/apk-signature.txt" >> "$RUNNER_TEMP/apk-details.txt"
           stage="$RUNNER_TEMP/kiwi-engine-qa"
           mkdir "$stage"
           cp "$apk" "$stage/kiwinext-x64-dev.apk"
@@ -220,7 +253,7 @@ jobs:
           printf '%s\n' "$DEPOT_TOOLS_REVISION" > "$stage/depot-tools-commit.txt"
           (cd "$stage" && sha256sum kiwinext-x64-dev.apk > SHA256SUMS.txt)
       - name: Upload verified engineering APK for emulator testing only
-        if: steps.build.outputs.outcome == 'apk'
+        if: steps.build.outputs.outcome == 'apk' && steps.verify.outcome == 'success'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: x64-engine-feasibility-only
@@ -228,7 +261,8 @@ jobs:
           if-no-files-found: error
           retention-days: 7
       - name: Pack the verified compiler cache and new progress
-        if: steps.build.outputs.outcome == 'partial'
+        id: pack
+        if: ${{ !cancelled() && (steps.build.outputs.outcome == 'partial' || steps.verify.outcome == 'failure') }}
         shell: bash
         run: |
           set -euo pipefail
@@ -249,7 +283,8 @@ jobs:
           (cd "$exchange" && sha256sum ccache.tar.zst seed.ninja_log inputs.txt seed-misses.txt > SHA256SUMS)
           printf 'Forwarding %s compiler results/hits as candidate entries; archive %s bytes.\n' "$compiled" "$compressed"
       - name: Check repository cache headroom before saving
-        if: steps.build.outputs.outcome == 'partial'
+        id: cache-budget
+        if: ${{ !cancelled() && (steps.pack.outcome == 'success') }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -270,7 +305,7 @@ jobs:
             exit 1
           }
       - name: Save bounded compiler cache for the next runner
-        if: steps.build.outputs.outcome == 'partial'
+        if: ${{ !cancelled() && (steps.cache-budget.outcome == 'success') }}
         uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7
         with:
           path: ${{ runner.temp }}/kiwi-checkpoint
