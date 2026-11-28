@@ -15,14 +15,14 @@ concurrency:
 env:
   DEPOT_TOOLS_UPDATE: '0'
   DEPOT_TOOLS_REVISION: ac31fc680158b9ad57e4020e53943a6abd85fcd7
-  ORIGINAL_CACHE: kiwi-apk-chain-v1-46055578418-1-third
+  ORIGINAL_CACHE: kiwi-apk-extended-v1-46066631639-1
   CHAIN_CACHE: kiwi-apk-extended-v1-${{ github.run_id }}-${{ github.run_attempt }}
 
 jobs:
   package:
     if: github.repository == 'Ktclat/kiwi-next' && github.ref == 'refs/heads/test/android-checkpoint'
     runs-on: ubuntu-24.04
-    timeout-minutes: 290
+    timeout-minutes: 345
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -112,7 +112,7 @@ jobs:
           path: ${{ runner.temp }}/kiwi-checkpoint
           key: ${{ env.ORIGINAL_CACHE }}
           fail-on-cache-miss: true
-      - name: Build the APK from the verified third-runner cache
+      - name: Build the APK from the verified 4-hour checkpoint
         id: build
         if: steps.compiler-cache.outputs.cache-hit == 'true'
         shell: bash
@@ -122,7 +122,7 @@ jobs:
           out=out/kiwinext-x64
           exchange="$RUNNER_TEMP/kiwi-checkpoint"
           export CCACHE_DIR="$RUNNER_TEMP/kiwi-ccache"
-          export CCACHE_MAXSIZE=2Gi
+          export CCACHE_MAXSIZE=3Gi
           export CCACHE_COMPILERCHECK=content
           export CCACHE_CONFIGPATH=/dev/null
           mkdir "$CCACHE_DIR"
@@ -154,7 +154,7 @@ jobs:
           reporter=$!
           trap 'kill "$reporter" 2>/dev/null || true' EXIT
           rc=0
-          timeout --signal=INT --kill-after=30s 240m autoninja -C "$out" chrome_public_apk > "$log" 2>&1 || rc=$?
+          timeout --signal=INT --kill-after=30s 300m autoninja -C "$out" chrome_public_apk > "$log" 2>&1 || rc=$?
           elapsed=$((SECONDS-start))
           kill "$reporter" 2>/dev/null || true
           wait "$reporter" 2>/dev/null || true
@@ -163,6 +163,7 @@ jobs:
           df -h .
           if (( rc == 0 )); then
             test -s "$out/apks/ChromePublic.apk"
+            /usr/bin/ccache --show-stats --verbose
             echo 'outcome=apk' >> "$GITHUB_OUTPUT"
             printf 'APK compiled in %ss; package verification follows.\n' "$elapsed" | tee -a "$GITHUB_STEP_SUMMARY"
             exit 0
@@ -213,6 +214,8 @@ jobs:
           cp "$apk" "$stage/kiwinext-x64-dev.apk"
           cp "$RUNNER_TEMP/apk-details.txt" "$stage/"
           git rev-parse HEAD > "$stage/chromium-commit.txt"
+          printf '%s\n' "$GITHUB_SHA" > "$stage/kiwi-workflow-commit.txt"
+          cp out/kiwinext-x64/args.gn "$stage/build-args.gn"
           printf '%s\n' "$DEPOT_TOOLS_REVISION" > "$stage/depot-tools-commit.txt"
           (cd "$stage" && sha256sum kiwinext-x64-dev.apk > SHA256SUMS.txt)
       - name: Upload verified engineering APK for emulator testing only
@@ -233,12 +236,12 @@ jobs:
           exchange="$RUNNER_TEMP/kiwi-checkpoint"
           cache="$RUNNER_TEMP/kiwi-ccache"
           read -r bytes _ < <(du -sb "$cache")
-          (( bytes > 10000 && bytes <= 2560 * 1024 * 1024 ))
+          (( bytes > 10000 && bytes <= 3584 * 1024 * 1024 ))
           compiled="$(awk '$1 == "cache_miss" || $1 == "direct_cache_hit" || $1 == "preprocessed_cache_hit" {sum += $2} END {print sum+0}' "$RUNNER_TEMP/ccache-stats.tsv")"
           [[ "$compiled" =~ ^[0-9]+$ ]] && (( compiled >= 100 ))
           tar --format=posix -C "$cache" -cf - . | zstd -q -T2 -3 -o "$exchange/ccache.next.tar.zst"
           compressed="$(stat -c %s "$exchange/ccache.next.tar.zst")"
-          (( compressed <= 2560 * 1024 * 1024 ))
+          (( compressed <= 3584 * 1024 * 1024 ))
           mv -- "$exchange/ccache.next.tar.zst" "$exchange/ccache.tar.zst"
           cp -- "$out/.ninja_log" "$exchange/seed.ninja_log"
           printf '%s\n' "$compiled" > "$exchange/seed-misses.txt"
