@@ -3,7 +3,7 @@ name: Kiwi Android cached APK signing investigation
 on:
   push:
     branches: [test/android-checkpoint]
-    paths: ['.github/workflows/android-checkpoint.yml', 'tools/compare_ninja_progress.py', 'tools/check_apk_signer.py']
+    paths: ['.github/workflows/android-checkpoint.yml', 'tools/compare_ninja_progress.py', 'tools/check_apk_signer.py', 'tests/test_check_apk_signer.py']
 
 permissions:
   contents: read
@@ -16,7 +16,7 @@ concurrency:
 env:
   DEPOT_TOOLS_UPDATE: '0'
   DEPOT_TOOLS_REVISION: ac31fc680158b9ad57e4020e53943a6abd85fcd7
-  ORIGINAL_CACHE: kiwi-apk-extended-v1-46093054194-1
+  ORIGINAL_CACHE: kiwi-apk-extended-v1-46137503207-1
   CHAIN_CACHE: kiwi-apk-extended-v1-${{ github.run_id }}-${{ github.run_attempt }}
 
 jobs:
@@ -28,6 +28,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
+      - name: Test signer validation before starting the Chromium build
+        run: python3 -m unittest discover -s tests -p test_check_apk_signer.py
       - name: Check capacity on a disposable hosted runner
         shell: bash
         run: |
@@ -239,7 +241,7 @@ jobs:
             exit 1
           fi
           if ! python3 "$GITHUB_WORKSPACE/tools/check_apk_signer.py" "$RUNNER_TEMP/apk-signature.txt"; then
-            echo "::error::Cryptographic verification passed, but the reported signer did not match the pinned certificate"
+            echo "::error::Cryptographic verification passed, but the signer report could not prove one matching pinned certificate"
             exit 1
           fi
           cat "$RUNNER_TEMP/apk-signature.txt" >> "$RUNNER_TEMP/apk-details.txt"
